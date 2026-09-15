@@ -34,6 +34,8 @@ jobs:
           path: |
             data/database.db
             storage/
+            data/working_servers.json
+            data/current_server_idx
           key: ${{ runner.os }}-parser-state-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-parser-state-
@@ -60,23 +62,22 @@ jobs:
             echo "❌ В config.toml нет секции [avito]!"
             exit 1
           fi
-          echo "✅ config.toml декодирован: $(wc -l < data/config.toml) строк"
+          echo "✅ config.toml декодирован"
 
       - name: Sanitize config for current image
         run: |
           cat > data/sanitize.py <<'PYEOF'
           import tomllib, tomli_w, dataclasses, dto
-          path = "config.toml"
-          with open(path, "rb") as f:
+          with open("config.toml", "rb") as f:
               data = tomllib.load(f)
           valid = {f.name for f in dataclasses.fields(dto.AvitoConfig)}
           avito = data.get("avito", {})
           removed = [k for k in list(avito.keys()) if k not in valid]
           for k in removed:
               del avito[k]
-          with open(path, "wb") as f:
+          with open("config.toml", "wb") as f:
               tomli_w.dump(data, f)
-          print(f"🧹 Удалено полей, неизвестных образу: {removed if removed else '(нет)'}")
+          print(f"🧹 Удалено полей: {removed if removed else '(нет)'}")
           PYEOF
           docker run --rm \
             -v "$PWD/data/config.toml:/app/config.toml" \
@@ -84,10 +85,9 @@ jobs:
             --entrypoint python \
             ghcr.io/avparsolog/parser_avito:latest /app/sanitize.py
 
-      - name: Setup Xray + pick working Russian VLESS server
+      - name: Setup Xray
         run: |
           set -e
-          # --- Xray ---
           echo "⬇️ Скачиваю Xray-core..."
           curl -fsSL -o /tmp/xray.zip \
             https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
@@ -96,194 +96,32 @@ jobs:
           chmod +x xray_bin/xray
           ./xray_bin/xray version | head -n1
 
-          # --- Пикер сервера ---
-          cat > data/pick_vless.py <<'PYEOF'
-          import urllib.parse, urllib.request, socket, json, sys, random
-
-          VLESS_LIST_URL = "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
-          XRAY_CONFIG = "data/xray_config.json"
-          PROXY_PORT = 1080
-          TCP_TIMEOUT = 3
-          MAX_TRY = 40
-
-          RU_TAGS = ["ru", "russia", "россия", "🇷🇺", "russian", "msk", "moscow",
-                     "спб", "saint", "petersburg", "novosibirsk", "ekaterinburg"]
-
-          def fetch_list():
-              req = urllib.request.Request(VLESS_LIST_URL, headers={"User-Agent": "Mozilla/5.0"})
-              with urllib.request.urlopen(req, timeout=25) as r:
-                  return r.read().decode("utf-8", "ignore").splitlines()
-
-          def parse_vless(url):
-              if not url.startswith("vless://"):
-                  return None
-              try:
-                  u = urllib.parse.urlparse(url)
-                  params = dict(urllib.parse.parse_qsl(u.query))
-                  return {
-                      "uuid": urllib.parse.unquote(u.username or ""),
-                      "host": u.hostname,
-                      "port": u.port,
-                      "params": params,
-                      "name": urllib.parse.unquote(u.fragment) if u.fragment else "",
-                  }
-              except Exception:
-                  return None
-
-          def is_russian(v):
-              blob = (v["name"] or "").lower()
-              return any(t in blob for t in RU_TAGS)
-
-          def tcp_ping(host, port, timeout=TCP_TIMEOUT):
-              try:
-                  s = socket.create_connection((host, port), timeout=timeout)
-                  s.close()
-                  return True
-              except Exception:
-                  return False
-
-          def is_config_usable(v):
-              p = v["params"]
-              sec = p.get("security", "none")
-              net = p.get("type", "tcp")
-              if sec == "reality" and not p.get("pbk"):
-                  return False
-              if net == "grpc" and not p.get("serviceName"):
-                  return False
-              return True
-
-          def build_xray_config(v):
-              p = v["params"]
-              net = p.get("type", "tcp")
-              security = p.get("security", "none")
-
-              stream = {"network": net}
-              if net == "ws":
-                  stream["wsSettings"] = {
-                      "path": p.get("path", "/"),
-                      "headers": {"Host": p.get("host", v["host"])},
-                  }
-              elif net == "grpc":
-                  stream["grpcSettings"] = {"serviceName": p.get("serviceName", "")}
-              elif net == "tcp" and p.get("headerType") == "http":
-                  stream["tcpSettings"] = {
-                      "header": {
-                          "type": "http",
-                          "request": {
-                              "path": [p.get("path", "/")],
-                              "headers": {"Host": [p.get("host", v["host"])]},
-                          },
-                      }
-                  }
-
-              if security == "tls":
-                  stream["security"] = "tls"
-                  stream["tlsSettings"] = {
-                      "serverName": p.get("sni", v["host"]),
-                      "fingerprint": p.get("fp", "chrome"),
-                      "allowInsecure": p.get("allowInsecure", "0") == "1",
-                  }
-              elif security == "reality":
-                  stream["security"] = "reality"
-                  stream["realitySettings"] = {
-                      "serverName": p.get("sni", ""),
-                      "fingerprint": p.get("fp", "chrome"),
-                      "publicKey": p.get("pbk", ""),
-                      "shortId": p.get("sid", ""),
-                      "spiderX": p.get("spx", "/"),
-                  }
-
-              return {
-                  "log": {"loglevel": "warning"},
-                  "inbounds": [{
-                      "listen": "127.0.0.1",
-                      "port": PROXY_PORT,
-                      "protocol": "http",
-                      "settings": {"timeout": 0},
-                  }],
-                  "outbounds": [{
-                      "protocol": "vless",
-                      "settings": {
-                          "vnext": [{
-                              "address": v["host"],
-                              "port": int(v["port"]),
-                              "users": [{
-                                  "id": v["uuid"],
-                                  "encryption": "none",
-                                  "flow": p.get("flow", ""),
-                              }],
-                          }],
-                      },
-                      "streamSettings": stream,
-                  }],
-              }
-
-          def main():
-              print("📥 Скачиваю список VLESS...")
-              lines = fetch_list()
-              print(f"   строк в файле: {len(lines)}")
-
-              parsed = [parse_vless(l.strip()) for l in lines if l.strip().startswith("vless://")]
-              parsed = [v for v in parsed if v and v["host"] and v["port"] and v["uuid"]]
-              print(f"   валидных VLESS: {len(parsed)}")
-
-              ru = [v for v in parsed if is_russian(v) and is_config_usable(v)]
-              print(f"   российских и пригодных: {len(ru)}")
-
-              if not ru:
-                  print("❌ Нет пригодных российских серверов")
-                  sys.exit(1)
-
-              random.shuffle(ru)
-              checked = 0
-              for v in ru:
-                  if checked >= MAX_TRY:
-                      break
-                  checked += 1
-                  ok = tcp_ping(v["host"], v["port"])
-                  mark = "✅" if ok else "❌"
-                  print(f"   [{checked:02d}] {mark} {v['host']}:{v['port']} — {(v['name'] or '')[:50]}")
-                  if ok:
-                      cfg = build_xray_config(v)
-                      with open(XRAY_CONFIG, "w") as f:
-                          json.dump(cfg, f, indent=2)
-                      print(f"\n🎯 Выбран: {v['name'] or v['host']}")
-                      print(f"   host={v['host']} port={v['port']} "
-                            f"security={v['params'].get('security','none')} "
-                            f"net={v['params'].get('type','tcp')}")
-                      return
-
-              print("❌ Ни один сервер не ответил на TCP ping")
-              sys.exit(1)
-
-          if __name__ == "__main__":
-              main()
-          PYEOF
-
-          python3 data/pick_vless.py
-
-      - name: Start Xray proxy
+      - name: Build working servers list (test all sources)
         run: |
           set -e
+          python3 data/pick_vless.py build 2>&1 | tee data/build_log.txt
+
+      - name: Start Xray with first working server
+        run: |
+          set -e
+          python3 data/pick_vless.py pick
+
           nohup ./xray_bin/xray -c data/xray_config.json > data/xray.log 2>&1 &
           echo $! > data/xray.pid
           echo "Xray PID: $(cat data/xray.pid)"
 
-          # Ждём пока порт 1080 откроется
           for i in $(seq 1 20); do
             if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
               exec 3>&- 3<&-
               echo "✅ Xray слушает на 127.0.0.1:1080 (после ${i}с)"
-              # Тест наружу через xray
-              echo "🌐 Проверяю внешний IP через прокси..."
-              curl -s --max-time 15 -x http://127.0.0.1:1080 https://api.ipify.org || echo "(не удалось получить IP)"
+              echo "🌐 Внешний IP через прокси:"
+              curl -s --max-time 15 -x http://127.0.0.1:1080 https://api.ipify.org || echo "(не удалось)"
               echo ""
               exit 0
             fi
             sleep 1
           done
-
-          echo "❌ Xray не поднялся за 20 секунд. Лог:"
+          echo "❌ Xray не поднялся"
           cat data/xray.log || true
           exit 1
 
@@ -304,22 +142,27 @@ jobs:
           print("✅ config.toml: proxy_string = 127.0.0.1:1080")
           PYEOF
 
-      - name: Run parser loop (5.5 hours)
+      - name: Run parser loop with auto-switch on block
         run: |
           set -u
           END_TIME=$(( $(date +%s) + 19800 ))
           CYCLE_INTERVAL=300
           PARSER_MAX_RUNTIME=270
+          BLOCK_THRESHOLD=3   # сколько подряд 403/429/439 до переключения
 
           CYCLE=0
+          BLOCK_COUNT=0
+
           while [ $(date +%s) -lt $END_TIME ]; do
             CYCLE=$(( CYCLE + 1 ))
             CYCLE_START=$(date +%s)
             CONTAINER_NAME="avito_parser_${GITHUB_RUN_ID}_${CYCLE}"
 
             echo "═══════════════════════════════════════════════════"
-            echo "▶ Цикл #${CYCLE} стартовал: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "▶ Цикл #${CYCLE}: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "═══════════════════════════════════════════════════"
+
+            LOG_FILE="data/cycle_${CYCLE}.log"
 
             timeout --signal=SIGTERM --kill-after=15 $PARSER_MAX_RUNTIME \
               docker run --rm \
@@ -329,22 +172,67 @@ jobs:
                 -v "$PWD/data/database.db:/app/database.db" \
                 -v "$PWD/storage:/app/storage" \
                 -v "$PWD/result:/app/result" \
-                -v "$PWD/patches/client.py:/app/parser/http/client.py:ro"\
+                -v "$PWD/patches/client.py:/app/parser/http/client.py:ro" \
                 ghcr.io/avparsolog/parser_avito:latest \
+              2>&1 | tee "$LOG_FILE" \
               || echo "⚠️ Проход завершился с кодом $? — продолжаю"
 
             docker kill "$CONTAINER_NAME" 2>/dev/null || true
 
+            # ─── Проверка на блокировку IP ───
+            if grep -q "Доступ ограничен" "$LOG_FILE" 2>/dev/null; then
+              BLOCK_COUNT=$(( BLOCK_COUNT + 1 ))
+              echo "⚠️ Обнаружена блокировка IP (${BLOCK_COUNT}/${BLOCK_THRESHOLD})"
+            else
+              BLOCK_COUNT=0
+            fi
+
+            # ─── Переключение сервера при блокировке ───
+            if [ $BLOCK_COUNT -ge $BLOCK_THRESHOLD ]; then
+              echo "🔄 Смена сервера: перезапуск Xray с новым VLESS"
+              kill "$(cat data/xray.pid)" 2>/dev/null || true
+              sleep 2
+
+              python3 data/pick_vless.py next
+
+              nohup ./xray_bin/xray -c data/xray_config.json > data/xray.log 2>&1 &
+              echo $! > data/xray.pid
+              sleep 4
+
+              # Проверяем, что новый сервер работает
+              if curl -s --max-time 15 -x http://127.0.0.1:1080 https://api.ipify.org >/dev/null; then
+                echo "✅ Новый сервер активен"
+                BLOCK_COUNT=0
+              else
+                echo "❌ Новый сервер не работает, пробую следующий"
+                # (можно продолжить перебор в цикле)
+              fi
+            fi
+
             ELAPSED=$(( $(date +%s) - CYCLE_START ))
             WAIT=$(( CYCLE_INTERVAL - ELAPSED ))
             if [ $WAIT -gt 0 ]; then
-              echo "⏱ Проход занял ${ELAPSED}с, пауза ${WAIT}с"
+              echo "⏱ Пауза ${WAIT}с"
               sleep $WAIT
-            else
-              echo "⚠️ Проход занял больше ${CYCLE_INTERVAL}с — иду сразу на следующий"
             fi
           done
-          echo "✅ Истекли 5.5 часа, выходим из цикла"
+
+      - name: List results
+        if: always()
+        run: ls -la result/ || true
+
+      - name: Upload Excel + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-results-${{ github.run_id }}
+          path: |
+            result/
+            data/build_log.txt
+            data/working_servers.json
+            data/test_log.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Send results to Telegram
         if: always()
@@ -405,6 +293,8 @@ jobs:
           path: |
             data/database.db
             storage/
+            data/working_servers.json
+            data/current_server_idx
           key: ${{ runner.os }}-parser-state-${{ github.run_id }}
 
       - name: 🔄 Self-renew
