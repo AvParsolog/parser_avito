@@ -59,11 +59,12 @@ PORT_BASE        = 10800       # 10800..10859
 TCP_TIMEOUT         = 2
 XRAY_WAIT           = 3
 HTTP_TIMEOUT        = 8
-BUILD_TIME_BUDGET   = 90 * 60
-FLUSH_TESTED_EVERY  = 60       # сек между сохранениями tested_set
+BUILD_TIME_BUDGET   = 999_999_999   # практически без лимита — идём до конца
+FLUSH_TESTED_EVERY  = 60            # сек между сохранениями tested_set
 
 # ─── Цели ───
-MAX_WINNERS = 50
+MAX_WINNERS = 999_999               # не останавливаемся, пока есть серверы
+
 
 # ─── Тестовый URL Avito ───
 TEST_URL = (
