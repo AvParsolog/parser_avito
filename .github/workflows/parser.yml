@@ -1,0 +1,115 @@
+name: Avito Parser — Continuous Runner
+
+on:
+  # Страховочный cron: если цепочка само-перезапуска оборвётся, GitHub сам
+  # поднимет её в течение 6 часов.
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+# Нужны права на запуск workflow (для само-перезапуска) и на чтение кода
+permissions:
+  contents: read
+  actions: write
+
+# Не даём двум запускам работать одновременно
+concurrency:
+  group: avito-parser
+  cancel-in-progress: false
+
+jobs:
+  parse-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # 5ч50м — с запасом меньше 6-часового лимита GitHub
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore state (database + storage) from previous runs
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/database.db
+            storage/
+          key: ${{ runner.os }}-parser-state
+          restore-keys: |
+            ${{ runner.os }}-parser-state
+
+      - name: Prepare working directories
+        run: |
+          mkdir -p data result storage
+          [ -f data/database.db ] || touch data/database.db
+
+      - name: Write config.toml from secret
+        env:
+          CONFIG_TOML: ${{ secrets.CONFIG_TOML }}
+        run: |
+          if [ -z "$CONFIG_TOML" ]; then
+            echo "❌ Секрет CONFIG_TOML не задан!"
+            exit 1
+          fi
+          printf '%s' "$CONFIG_TOML" > data/config.toml
+          echo "✅ config.toml записан ($(wc -l < data/config.toml) строк)"
+
+      - name: Run parser loop (5.5 hours)
+        run: |
+          set -u
+          END_TIME=$(( $(date +%s) + 19800 ))    # 5.5 часов
+          CYCLE_INTERVAL=300                     # 5 минут между циклами
+          PARSER_MAX_RUNTIME=270                 # максимум 4.5 мин на один проход
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            CYCLE_START=$(date +%s)
+            echo "═══════════════════════════════════════════════════"
+            echo "▶ Цикл стартовал: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "═══════════════════════════════════════════════════"
+
+            # one_time_start=true в конфиге → парсер завершится сам после прохода
+            timeout $PARSER_MAX_RUNTIME docker run --rm \
+              --name "avito_parser_$$" \
+              -v "$PWD/data/config.toml:/app/config.toml:ro" \
+              -v "$PWD/data/database.db:/app/database.db" \
+              -v "$PWD/storage:/app/storage" \
+              -v "$PWD/result:/app/result" \
+              ghcr.io/duff89/parser_avito:latest \
+              || echo "⚠️ Проход завершился с кодом $? — продолжаю"
+
+            ELAPSED=$(( $(date +%s) - CYCLE_START ))
+            WAIT=$(( CYCLE_INTERVAL - ELAPSED ))
+            if [ $WAIT -gt 0 ]; then
+              echo "⏱ Пауза ${WAIT}с до следующего цикла"
+              sleep $WAIT
+            else
+              echo "⚠️ Проход занял больше ${CYCLE_INTERVAL}с — иду сразу на следующий"
+            fi
+          done
+          echo "✅ Истекли 5.5 часа, выходим из цикла"
+
+      - name: Upload Excel results (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-results-${{ github.run_id }}
+          path: result/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Save state for next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/database.db
+            storage/
+          key: ${{ runner.os }}-parser-state-${{ github.run_id }}
+
+      - name: 🔄 Self-renew — запускаю следующий workflow
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Запускаю следующую итерацию…"
+          gh workflow run parser.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}"
