@@ -1,5 +1,5 @@
 FROM python:3.11-slim
-LABEL org.opencontainers.image.source=https://github.com/Duff89/parser_avito
+LABEL org.opencontainers.image.source=https://github.com/avparsolog/parser_avito
 
 RUN apt-get update && apt-get install \
 -y --ignore-missing --no-install-recommends --no-install-suggests \
@@ -28,7 +28,9 @@ COPY requirements.txt /app/requirements.txt
 WORKDIR /app
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-RUN python -m playwright install chromium-headless-shell
+# ─── Браузеры: Chromium (базовый) + WebKit (для Safari-эмуляции) ───
+RUN python -m playwright install chromium-headless-shell webkit
+RUN python -m playwright install-deps webkit
 
 COPY . /app
 COPY entrypoint.sh /
