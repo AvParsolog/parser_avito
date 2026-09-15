@@ -32,16 +32,16 @@ jobs:
           path: |
             data/database.db
             storage/
-          key: ${{ runner.os }}-parser-state
+          key: ${{ runner.os }}-parser-state-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-parser-state
+            ${{ runner.os }}-parser-state-
 
       - name: Prepare working directories
         run: |
           mkdir -p data result storage
           [ -f data/database.db ] || touch data/database.db
 
-           - name: Write config.toml from base64 secret
+      - name: Write config.toml from base64 secret
         env:
           CONFIG_TOML_B64: ${{ secrets.CONFIG_TOML_B64 }}
         run: |
@@ -50,17 +50,13 @@ jobs:
             exit 1
           fi
 
-          # Декодируем base64 → config.toml
-          # -d = decode, -i = игнорировать мусорные символы, --ignore-garbage
           printf '%s' "$CONFIG_TOML_B64" | base64 -d > data/config.toml
 
-          # Проверки
           if [ ! -s data/config.toml ]; then
             echo "❌ config.toml пустой после декодирования!"
             exit 1
           fi
 
-          # Валидация: файл должен быть валидным TOML и содержать секцию [avito]
           if ! grep -q '^\[avito\]' data/config.toml; then
             echo "❌ В config.toml нет секции [avito]!"
             exit 1
@@ -75,26 +71,34 @@ jobs:
           CYCLE_INTERVAL=300                     # 5 минут между циклами
           PARSER_MAX_RUNTIME=270                 # максимум 4.5 мин на один проход
 
+          CYCLE=0
           while [ $(date +%s) -lt $END_TIME ]; do
+            CYCLE=$(( CYCLE + 1 ))
             CYCLE_START=$(date +%s)
+            CONTAINER_NAME="avito_parser_${GITHUB_RUN_ID}_${CYCLE}"
+
             echo "═══════════════════════════════════════════════════"
-            echo "▶ Цикл стартовал: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "▶ Цикл #${CYCLE} стартовал: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "═══════════════════════════════════════════════════"
 
             # one_time_start=true в конфиге → парсер завершится сам после прохода
-            timeout $PARSER_MAX_RUNTIME docker run --rm \
-              --name "avito_parser_$$" \
-              -v "$PWD/data/config.toml:/app/config.toml:ro" \
-              -v "$PWD/data/database.db:/app/database.db" \
-              -v "$PWD/storage:/app/storage" \
-              -v "$PWD/result:/app/result" \
-              ghcr.io/duff89/parser_avito:latest \
+            timeout --signal=SIGTERM --kill-after=15 $PARSER_MAX_RUNTIME \
+              docker run --rm \
+                --name "$CONTAINER_NAME" \
+                -v "$PWD/data/config.toml:/app/config.toml:ro" \
+                -v "$PWD/data/database.db:/app/database.db" \
+                -v "$PWD/storage:/app/storage" \
+                -v "$PWD/result:/app/result" \
+                ghcr.io/duff89/parser_avito:latest \
               || echo "⚠️ Проход завершился с кодом $? — продолжаю"
+
+            # На всякий случай добиваем зависший контейнер
+            docker kill "$CONTAINER_NAME" 2>/dev/null || true
 
             ELAPSED=$(( $(date +%s) - CYCLE_START ))
             WAIT=$(( CYCLE_INTERVAL - ELAPSED ))
             if [ $WAIT -gt 0 ]; then
-              echo "⏱ Пауза ${WAIT}с до следующего цикла"
+              echo "⏱ Проход занял ${ELAPSED}с, пауза ${WAIT}с"
               sleep $WAIT
             else
               echo "⚠️ Проход занял больше ${CYCLE_INTERVAL}с — иду сразу на следующий"
