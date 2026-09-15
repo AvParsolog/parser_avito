@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.55.0-noble
 LABEL org.opencontainers.image.source=https://github.com/avparsolog/parser_avito
 
 WORKDIR /app
