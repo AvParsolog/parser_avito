@@ -82,7 +82,7 @@ jobs:
             -v "$PWD/data/config.toml:/app/config.toml" \
             -v "$PWD/data/sanitize.py:/app/sanitize.py:ro" \
             --entrypoint python \
-            ghcr.io/duff89/parser_avito:latest /app/sanitize.py
+            ghcr.io/avparsolog/parser_avito:latest /app/sanitize.py
 
       - name: Setup Xray + pick working Russian VLESS server
         run: |
@@ -330,7 +330,7 @@ jobs:
                 -v "$PWD/storage:/app/storage" \
                 -v "$PWD/result:/app/result" \
                 -v "$PWD/patches/client.py:/app/parser/http/client.py:ro"\
-                ghcr.io/duff89/parser_avito:latest \
+                ghcr.io/avparsolog/parser_avito:latest \
               || echo "⚠️ Проход завершился с кодом $? — продолжаю"
 
             docker kill "$CONTAINER_NAME" 2>/dev/null || true
