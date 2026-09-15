@@ -41,16 +41,32 @@ jobs:
           mkdir -p data result storage
           [ -f data/database.db ] || touch data/database.db
 
-      - name: Write config.toml from secret
+           - name: Write config.toml from base64 secret
         env:
-          CONFIG_TOML: ${{ secrets.CONFIG_TOML }}
+          CONFIG_TOML_B64: ${{ secrets.CONFIG_TOML_B64 }}
         run: |
-          if [ -z "$CONFIG_TOML" ]; then
-            echo "❌ Секрет CONFIG_TOML не задан!"
+          if [ -z "$CONFIG_TOML_B64" ]; then
+            echo "❌ Секрет CONFIG_TOML_B64 не задан!"
             exit 1
           fi
-          printf '%s' "$CONFIG_TOML" > data/config.toml
-          echo "✅ config.toml записан ($(wc -l < data/config.toml) строк)"
+
+          # Декодируем base64 → config.toml
+          # -d = decode, -i = игнорировать мусорные символы, --ignore-garbage
+          printf '%s' "$CONFIG_TOML_B64" | base64 -d > data/config.toml
+
+          # Проверки
+          if [ ! -s data/config.toml ]; then
+            echo "❌ config.toml пустой после декодирования!"
+            exit 1
+          fi
+
+          # Валидация: файл должен быть валидным TOML и содержать секцию [avito]
+          if ! grep -q '^\[avito\]' data/config.toml; then
+            echo "❌ В config.toml нет секции [avito]!"
+            exit 1
+          fi
+
+          echo "✅ config.toml декодирован: $(wc -l < data/config.toml) строк, $(wc -c < data/config.toml) байт"
 
       - name: Run parser loop (5.5 hours)
         run: |
