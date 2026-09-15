@@ -17,18 +17,19 @@ permissions:
 
 concurrency:
   group: avito-parser
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source == 'chain' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.inputs.source == 'chain' }}
 
 jobs:
   parse-loop:
-    runs-on: ubuntu-latest
+    # ARM: 4 vCPU / 16 GB RAM, бесплатно для публичных репо
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 350
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore state (database + storage) from previous runs
+      - name: Restore state
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -36,48 +37,36 @@ jobs:
             storage/
             data/working_servers.json
             data/current_server_idx
+            data/tested_servers.txt
           key: ${{ runner.os }}-parser-state-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-parser-state-
 
-      - name: Prepare working directories
+      - name: Prepare dirs
         run: |
-          mkdir -p data result storage
+          mkdir -p data result storage xray_bin
           [ -f data/database.db ] || touch data/database.db
 
-      - name: Write config.toml from base64 secret
+      - name: Write config.toml from base64
         env:
           CONFIG_TOML_B64: ${{ secrets.CONFIG_TOML_B64 }}
         run: |
-          if [ -z "$CONFIG_TOML_B64" ]; then
-            echo "❌ Секрет CONFIG_TOML_B64 не задан!"
-            exit 1
-          fi
+          [ -z "$CONFIG_TOML_B64" ] && { echo "❌ CONFIG_TOML_B64 пуст"; exit 1; }
           printf '%s' "$CONFIG_TOML_B64" | base64 -d > data/config.toml
-          if [ ! -s data/config.toml ]; then
-            echo "❌ config.toml пустой!"
-            exit 1
-          fi
-          if ! grep -q '^\[avito\]' data/config.toml; then
-            echo "❌ В config.toml нет секции [avito]!"
-            exit 1
-          fi
-          echo "✅ config.toml декодирован"
+          grep -q '^\[avito\]' data/config.toml || { echo "❌ нет секции [avito]"; exit 1; }
+          echo "✅ config.toml: $(wc -l < data/config.toml) строк"
 
-      - name: Sanitize config for current image
+      - name: Sanitize config
         run: |
           cat > data/sanitize.py <<'PYEOF'
           import tomllib, tomli_w, dataclasses, dto
-          with open("config.toml", "rb") as f:
-              data = tomllib.load(f)
+          with open("config.toml", "rb") as f: data = tomllib.load(f)
           valid = {f.name for f in dataclasses.fields(dto.AvitoConfig)}
           avito = data.get("avito", {})
           removed = [k for k in list(avito.keys()) if k not in valid]
-          for k in removed:
-              del avito[k]
-          with open("config.toml", "wb") as f:
-              tomli_w.dump(data, f)
-          print(f"🧹 Удалено полей: {removed if removed else '(нет)'}")
+          for k in removed: del avito[k]
+          with open("config.toml", "wb") as f: tomli_w.dump(data, f)
+          print(f"🧹 Удалено: {removed or '(нет)'}")
           PYEOF
           docker run --rm \
             -v "$PWD/data/config.toml:/app/config.toml" \
@@ -85,70 +74,93 @@ jobs:
             --entrypoint python \
             ghcr.io/avparsolog/parser_avito:latest /app/sanitize.py
 
-      - name: Setup Xray
+      - name: Download Xray (ARM)
         run: |
           set -e
-          echo "⬇️ Скачиваю Xray-core..."
-          curl -fsSL -o /tmp/xray.zip \
-            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          mkdir -p xray_bin
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            aarch64|arm64) URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip" ;;
+            x86_64|amd64)  URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" ;;
+            *) echo "❌ Неизвестная архитектура: $ARCH"; exit 1 ;;
+          esac
+          echo "🎯 Arch=$ARCH, URL=$URL"
+          curl -fsSL -o /tmp/xray.zip "$URL"
           unzip -q /tmp/xray.zip -d xray_bin
           chmod +x xray_bin/xray
           ./xray_bin/xray version | head -n1
 
-      - name: Build working servers list (test all sources)
-        run: |
-          set -e
-          python3 data/pick_vless.py build 2>&1 | tee data/build_log.txt
-
-      - name: Start Xray with first working server
-        run: |
-          set -e
-          python3 data/pick_vless.py pick
-
-          nohup ./xray_bin/xray -c data/xray_config.json > data/xray.log 2>&1 &
-          echo $! > data/xray.pid
-          echo "Xray PID: $(cat data/xray.pid)"
-
-          for i in $(seq 1 20); do
-            if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
-              exec 3>&- 3<&-
-              echo "✅ Xray слушает на 127.0.0.1:1080 (после ${i}с)"
-              echo "🌐 Внешний IP через прокси:"
-              curl -s --max-time 15 -x http://127.0.0.1:1080 https://api.ipify.org || echo "(не удалось)"
-              echo ""
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "❌ Xray не поднялся"
-          cat data/xray.log || true
-          exit 1
-
-      - name: Patch config with local xray proxy
+      - name: Patch config for local proxy
         run: |
           pip install --quiet tomli_w
           python3 - <<'PYEOF'
           import tomllib, tomli_w
-          with open("data/config.toml", "rb") as f:
-              data = tomllib.load(f)
+          with open("data/config.toml", "rb") as f: data = tomllib.load(f)
           data.setdefault("avito", {})
           data["avito"]["proxy_string"] = "127.0.0.1:1080"
           data["avito"]["proxy_change_url"] = ""
           data["avito"]["use_bypass_api"] = False
           data["avito"]["use_own_cookies"] = False
-          with open("data/config.toml", "wb") as f:
-              tomli_w.dump(data, f)
-          print("✅ config.toml: proxy_string = 127.0.0.1:1080")
+          with open("data/config.toml", "wb") as f: tomli_w.dump(data, f)
+          print("✅ proxy_string = 127.0.0.1:1080")
           PYEOF
 
-      - name: Run parser loop with auto-switch on block
+      - name: 🏃 Start hunter in background
+        run: |
+          mkdir -p data/logs
+          # hunter будет тестировать серверы и инкрементально писать
+          # в data/working_servers.json
+          nohup python3 data/pick_vless.py build \
+            > data/logs/hunter.log 2>&1 &
+          echo $! > data/hunter.pid
+          echo "🖥️ Hunter PID: $(cat data/hunter.pid)"
+
+      - name: ⏳ Wait for first working server
+        run: |
+          echo "Ждём первый рабочий сервер (макс 15 минут)..."
+          for i in $(seq 1 90); do
+            if [ -s data/working_servers.json ]; then
+              COUNT=$(python3 -c "import json; print(len(json.load(open('data/working_servers.json'))))" 2>/dev/null || echo 0)
+              if [ "$COUNT" -gt 0 ]; then
+                echo "✅ Найдено $COUNT рабочих серверов (за ${i}×10 сек)"
+                python3 data/pick_vless.py pick
+                break
+              fi
+            fi
+            sleep 10
+          done
+          if [ ! -s data/working_servers.json ] || [ "$(python3 -c "import json; print(len(json.load(open('data/working_servers.json'))))" 2>/dev/null || echo 0)" = "0" ]; then
+            echo "❌ Hunter не нашёл ни одного сервера за 15 минут"
+            echo "=== хвост hunter.log ==="
+            tail -n 60 data/logs/hunter.log
+            exit 1
+          fi
+
+      - name: 🚀 Start parser Xray on port 1080
+        run: |
+          set -e
+          nohup ./xray_bin/xray -c data/xray_config.json > data/logs/xray_parser.log 2>&1 &
+          echo $! > data/xray.pid
+
+          for i in $(seq 1 20); do
+            if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
+              exec 3>&- 3<&-
+              echo "✅ Xray на 1080 готов"
+              echo "🌐 Внешний IP:"
+              curl -s --max-time 15 -x http://127.0.0.1:1080 https://api.ipify.org || echo "(недоступно)"
+              echo ""
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "❌ Xray не поднялся"; cat data/logs/xray_parser.log; exit 1
+
+      - name: 🔄 Parser loop with live server swap
         run: |
           set -u
           END_TIME=$(( $(date +%s) + 19800 ))
           CYCLE_INTERVAL=300
           PARSER_MAX_RUNTIME=270
-          BLOCK_THRESHOLD=3   # сколько подряд 403/429/439 до переключения
+          BLOCK_THRESHOLD=3
 
           CYCLE=0
           BLOCK_COUNT=0
@@ -157,12 +169,18 @@ jobs:
             CYCLE=$(( CYCLE + 1 ))
             CYCLE_START=$(date +%s)
             CONTAINER_NAME="avito_parser_${GITHUB_RUN_ID}_${CYCLE}"
+            LOG_FILE="data/logs/cycle_${CYCLE}.log"
 
             echo "═══════════════════════════════════════════════════"
             echo "▶ Цикл #${CYCLE}: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "═══════════════════════════════════════════════════"
 
-            LOG_FILE="data/cycle_${CYCLE}.log"
+            # Перезагружаем актуальный конфиг сервера перед каждым циклом
+            # (вдруг hunter нашёл новые победители)
+            if [ -s data/working_servers.json ]; then
+              COUNT=$(python3 -c "import json; print(len(json.load(open('data/working_servers.json'))))" 2>/dev/null || echo 0)
+              echo "📋 Доступно рабочих серверов: $COUNT"
+            fi
 
             timeout --signal=SIGTERM --kill-after=15 $PARSER_MAX_RUNTIME \
               docker run --rm \
@@ -175,66 +193,80 @@ jobs:
                 -v "$PWD/patches/client.py:/app/parser/http/client.py:ro" \
                 ghcr.io/avparsolog/parser_avito:latest \
               2>&1 | tee "$LOG_FILE" \
-              || echo "⚠️ Проход завершился с кодом $? — продолжаю"
+              || echo "⚠️ Проход завершился с кодом $?"
 
             docker kill "$CONTAINER_NAME" 2>/dev/null || true
 
-            # ─── Проверка на блокировку IP ───
+            # ─── Проверка блока ───
             if grep -q "Доступ ограничен" "$LOG_FILE" 2>/dev/null; then
               BLOCK_COUNT=$(( BLOCK_COUNT + 1 ))
-              echo "⚠️ Обнаружена блокировка IP (${BLOCK_COUNT}/${BLOCK_THRESHOLD})"
+              echo "⚠️ Блок IP (${BLOCK_COUNT}/${BLOCK_THRESHOLD})"
             else
               BLOCK_COUNT=0
             fi
 
-            # ─── Переключение сервера при блокировке ───
+            # ─── Ротация сервера при блокировке ───
             if [ $BLOCK_COUNT -ge $BLOCK_THRESHOLD ]; then
-              echo "🔄 Смена сервера: перезапуск Xray с новым VLESS"
+              echo "🔄 Ротация: переключаю Xray"
               kill "$(cat data/xray.pid)" 2>/dev/null || true
               sleep 2
 
-              python3 data/pick_vless.py next
+              python3 data/pick_vless.py next || {
+                echo "⚠️ Не удалось переключиться, пробую pick"
+                python3 data/pick_vless.py pick || true
+              }
 
-              nohup ./xray_bin/xray -c data/xray_config.json > data/xray.log 2>&1 &
+              nohup ./xray_bin/xray -c data/xray_config.json > data/logs/xray_parser.log 2>&1 &
               echo $! > data/xray.pid
               sleep 4
 
-              # Проверяем, что новый сервер работает
               if curl -s --max-time 15 -x http://127.0.0.1:1080 https://api.ipify.org >/dev/null; then
                 echo "✅ Новый сервер активен"
                 BLOCK_COUNT=0
               else
-                echo "❌ Новый сервер не работает, пробую следующий"
-                # (можно продолжить перебор в цикле)
+                echo "⚠️ Новый сервер не отвечает — продолжу с этим"
               fi
             fi
 
             ELAPSED=$(( $(date +%s) - CYCLE_START ))
             WAIT=$(( CYCLE_INTERVAL - ELAPSED ))
-            if [ $WAIT -gt 0 ]; then
-              echo "⏱ Пауза ${WAIT}с"
-              sleep $WAIT
-            fi
+            [ $WAIT -gt 0 ] && { echo "⏱ Пауза ${WAIT}с"; sleep $WAIT; }
           done
+
+          echo "✅ Цикл парсера завершён"
+
+      - name: Show hunter progress
+        if: always()
+        run: |
+          echo "════ Hunter status ════"
+          if [ -f data/hunter.pid ] && kill -0 "$(cat data/hunter.pid)" 2>/dev/null; then
+            echo "🟢 Hunter ещё работает"
+          else
+            echo "⚫ Hunter завершился"
+          fi
+          echo "─── последние 30 строк hunter.log ───"
+          tail -n 30 data/logs/hunter.log || true
+          echo "─── working_servers.json ───"
+          cat data/working_servers.json 2>/dev/null | head -c 2000 || echo "(пусто)"
 
       - name: List results
         if: always()
         run: ls -la result/ || true
 
-      - name: Upload Excel + logs
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: parser-results-${{ github.run_id }}
           path: |
             result/
-            data/build_log.txt
             data/working_servers.json
             data/test_log.txt
+            data/logs/
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Send results to Telegram
+      - name: Send Excel to Telegram
         if: always()
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -242,51 +274,34 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set +e
-          if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
-            echo "⚠️ TG секреты не заданы — пропускаю"
-            exit 0
-          fi
+          [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ] && exit 0
           shopt -s nullglob
           files=(result/*.xlsx result/*.csv result/*.json)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "⚠️ В result/ нет файлов"
-            exit 0
-          fi
-          if [ ${#files[@]} -eq 1 ]; then
-            SEND_FILE="${files[0]}"
-          else
-            SEND_FILE="avito_results_${RUN_ID}.zip"
-            zip -j -q "$SEND_FILE" "${files[@]}"
-          fi
+          [ ${#files[@]} -eq 0 ] && exit 0
+          if [ ${#files[@]} -eq 1 ]; then SEND_FILE="${files[0]}"
+          else SEND_FILE="avito_results_${RUN_ID}.zip"; zip -j -q "$SEND_FILE" "${files[@]}"; fi
           SIZE_MB=$(( $(stat -c%s "$SEND_FILE") / 1024 / 1024 ))
-          CAPTION="📊 Avito Parser — run ${RUN_ID} | файлов: ${#files[@]} | размер: ${SIZE_MB} MB"
+          CAPTION="📊 run ${RUN_ID} | файлов: ${#files[@]} | ${SIZE_MB} MB"
           IFS=',' read -ra CHATS <<< "$TG_CHAT_ID"
           for CHAT in "${CHATS[@]}"; do
-            CHAT="$(echo "$CHAT" | xargs)"
-            [ -z "$CHAT" ] && continue
-            echo "→ chat_id=${CHAT}"
-            HTTP_CODE=$(curl -sS -o /tmp/tg_resp.json -w '%{http_code}' \
-              -F "chat_id=${CHAT}" \
-              -F "caption=${CAPTION}" \
+            CHAT="$(echo "$CHAT" | xargs)"; [ -z "$CHAT" ] && continue
+            CODE=$(curl -sS -o /tmp/tg.json -w '%{http_code}' \
+              -F "chat_id=${CHAT}" -F "caption=${CAPTION}" \
               -F "document=@${SEND_FILE}" \
               "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument")
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "   ✅ отправлено"
-            else
-              echo "   ❌ HTTP ${HTTP_CODE}:"; cat /tmp/tg_resp.json || true
-            fi
+            [ "$CODE" = "200" ] && echo "✅ ${CHAT}" || { echo "❌ ${CHAT}"; cat /tmp/tg.json; }
           done
           exit 0
 
-      - name: Stop Xray
+      - name: Stop processes
         if: always()
         run: |
-          if [ -f data/xray.pid ]; then
-            kill "$(cat data/xray.pid)" 2>/dev/null || true
-            echo "🛑 Xray остановлен"
-          fi
+          [ -f data/xray.pid ] && kill "$(cat data/xray.pid)" 2>/dev/null || true
+          [ -f data/hunter.pid ] && kill "$(cat data/hunter.pid)" 2>/dev/null || true
+          pkill -f "xray_bin/xray" 2>/dev/null || true
+          echo "🛑 процессы остановлены"
 
-      - name: Save state for next run
+      - name: Save state
         if: always()
         uses: actions/cache/save@v4
         with:
@@ -295,6 +310,7 @@ jobs:
             storage/
             data/working_servers.json
             data/current_server_idx
+            data/tested_servers.txt
           key: ${{ runner.os }}-parser-state-${{ github.run_id }}
 
       - name: 🔄 Self-renew
