@@ -15,10 +15,8 @@ permissions:
   contents: read
   actions: write
 
-# Хитрый concurrency:
-#  • chain   → cancel-in-progress: true  (убивает всё в группе, включая зависшие)
-#  • schedule/manual → cancel-in-progress: false (стоит в очереди, но будет
-#    вытеснен, когда следующий chain-ран стартует)
+# chain-раны (self-renew) отменяют всё в группе, в т.ч. зависшие scheduled.
+# scheduled/manual — стоят в очереди, но вытесняются, когда стартует chain.
 concurrency:
   group: avito-parser
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source == 'chain' }}
@@ -70,12 +68,40 @@ jobs:
 
           echo "✅ config.toml декодирован: $(wc -l < data/config.toml) строк, $(wc -c < data/config.toml) байт"
 
+      - name: Sanitize config for current image
+        run: |
+          cat > data/sanitize.py <<'PYEOF'
+          import tomllib, tomli_w, dataclasses, dto
+
+          path = "config.toml"
+          with open(path, "rb") as f:
+              data = tomllib.load(f)
+
+          valid = {f.name for f in dataclasses.fields(dto.AvitoConfig)}
+          avito = data.get("avito", {})
+          removed = [k for k in list(avito.keys()) if k not in valid]
+          for k in removed:
+              del avito[k]
+
+          with open(path, "wb") as f:
+              tomli_w.dump(data, f)
+
+          print(f"🧹 Удалено полей, неизвестных образу: {removed if removed else '(нет)'}")
+          print(f"✅ Осталось полей: {len(avito)}")
+          PYEOF
+
+          docker run --rm \
+            -v "$PWD/data/config.toml:/app/config.toml" \
+            -v "$PWD/data/sanitize.py:/app/sanitize.py:ro" \
+            --entrypoint python \
+            ghcr.io/duff89/parser_avito:latest /app/sanitize.py
+
       - name: Run parser loop (5.5 hours)
         run: |
           set -u
-          END_TIME=$(( $(date +%s) + 19800 ))
-          CYCLE_INTERVAL=300
-          PARSER_MAX_RUNTIME=270
+          END_TIME=$(( $(date +%s) + 19800 ))    # 5.5 часов
+          CYCLE_INTERVAL=300                     # 5 минут между циклами
+          PARSER_MAX_RUNTIME=270                 # максимум 4.5 мин на один проход
 
           CYCLE=0
           while [ $(date +%s) -lt $END_TIME ]; do
@@ -110,7 +136,13 @@ jobs:
           done
           echo "✅ Истекли 5.5 часа, выходим из цикла"
 
-      - name: Upload Excel results (optional)
+      - name: List results
+        if: always()
+        run: |
+          echo "════ Содержимое result/ ════"
+          ls -la result/ || echo "(папка пуста)"
+
+      - name: Upload Excel results (artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -118,6 +150,67 @@ jobs:
           path: result/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Send results to Telegram
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+
+          if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+            echo "⚠️ TG_BOT_TOKEN или TG_CHAT_ID не заданы — пропускаю отправку"
+            exit 0
+          fi
+
+          shopt -s nullglob
+          files=(result/*.xlsx result/*.csv result/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "⚠️ В result/ нет файлов — отправлять нечего"
+            exit 0
+          fi
+
+          if [ ${#files[@]} -eq 1 ]; then
+            SEND_FILE="${files[0]}"
+          else
+            SEND_FILE="avito_results_${RUN_ID}.zip"
+            zip -j -q "$SEND_FILE" "${files[@]}"
+          fi
+
+          SIZE_BYTES=$(stat -c%s "$SEND_FILE")
+          SIZE_MB=$(( SIZE_BYTES / 1024 / 1024 ))
+          CAPTION="📊 Avito Parser — результаты run ${RUN_ID} | файлов: ${#files[@]} | размер: ${SIZE_MB} MB"
+
+          echo "📤 Отправляю ${SEND_FILE} (${SIZE_BYTES} байт)"
+          echo "   chat_id: ${TG_CHAT_ID}"
+          echo "   caption: ${CAPTION}"
+
+          # Несколько chat_id через запятую
+          IFS=',' read -ra CHATS <<< "$TG_CHAT_ID"
+          ALL_OK=0
+          for CHAT in "${CHATS[@]}"; do
+            CHAT="$(echo "$CHAT" | xargs)"
+            [ -z "$CHAT" ] && continue
+            echo "→ chat_id=${CHAT}"
+            HTTP_CODE=$(curl -sS -o /tmp/tg_resp.json -w '%{http_code}' \
+              -F "chat_id=${CHAT}" \
+              -F "caption=${CAPTION}" \
+              -F "document=@${SEND_FILE}" \
+              "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "   ✅ отправлено"
+            else
+              echo "   ❌ ошибка HTTP ${HTTP_CODE}:"
+              cat /tmp/tg_resp.json || true
+              ALL_OK=1
+            fi
+          done
+
+          # Не валим job, даже если TG не принял — workflow важнее
+          exit 0
 
       - name: Save state for next run
         if: always()
