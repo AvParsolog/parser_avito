@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Высокопараллельный пикер VLESS/VMess/Trojan для Avito (v5).
+Высокопараллельный пикер VLESS/VMess/Trojan для Avito (v7).
 
-Особенности:
-  • Без лимита времени и количества — идём до конца пула
-  • Stability-чек: 3 запроса на сервер, сортируем по надёжности
-  • Фильтр Cloudflare-IP (нестабильная репутация)
-  • Инкрементальное сохранение + атомарные записи
-  • SIGTERM handler — сохраняет состояние при kill
-  • Работает на AMD64 и ARM64
+Новое в v7:
+  • Cooldown-механика для забаненных (Avito банит временно)
+  • Забаненные серверы возвращаются в пул через BAN_COOLDOWN секунд
+  • reset_expired_bans() вызывается в pick/next/stats
+  • pick/next пропускают тех, кто сейчас в cooldown
 """
 import os
 import sys
@@ -58,9 +56,9 @@ XRAY_CONFIG      = "data/xray_config.json"
 # ══════════════════════════════════════════════════════════════
 #  ПАРАЛЛЕЛЬНОСТЬ
 # ══════════════════════════════════════════════════════════════
-NUM_WORKERS      = 60          # параллельных Xray-инстансов
-TCP_THREADS      = 400         # потоков на TCP-ping
-PORT_BASE        = 10800       # 10800..10859
+NUM_WORKERS      = 60
+TCP_THREADS      = 400
+PORT_BASE        = 10800
 
 # ══════════════════════════════════════════════════════════════
 #  ТАЙМИНГИ
@@ -68,14 +66,24 @@ PORT_BASE        = 10800       # 10800..10859
 TCP_TIMEOUT         = 2
 XRAY_WAIT           = 3
 HTTP_TIMEOUT        = 8
-STABILITY_CHECKS    = 3        # сколько запросов на сервер
-STABILITY_PAUSE     = 2        # пауза между проверками
-FLUSH_TESTED_EVERY  = 60       # сек между сохранениями tested_set
-BUILD_TIME_BUDGET   = 999_999_999   # фактически без лимита
-MAX_WINNERS         = 999_999       # фактически без лимита
+STABILITY_CHECKS    = 3
+STABILITY_PAUSE     = 2
+FLUSH_TESTED_EVERY  = 60
+BUILD_TIME_BUDGET   = 999_999_999
+MAX_WINNERS         = 999_999
 
 # ══════════════════════════════════════════════════════════════
-#  ФИЛЬТР CLOUDFLARE
+#  COOLDOWN ДЛЯ ЗАБАНЕННЫХ
+# ══════════════════════════════════════════════════════════════
+# Avito банит обычно на 10-60 минут. Ставим 30 мин.
+# Через это время сервер снова пробуется: может, уже разблокирован.
+BAN_COOLDOWN_SEC = 30 * 60
+# Если сервер уже банился N раз — увеличиваем cooldown (backoff)
+BAN_COOLDOWN_MULTIPLIER = 2.0
+BAN_COOLDOWN_MAX = 4 * 60 * 60   # максимум 4 часа
+
+# ══════════════════════════════════════════════════════════════
+#  CLOUDFLARE
 # ══════════════════════════════════════════════════════════════
 CLOUDFLARE_RANGES = [
     "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
@@ -148,14 +156,11 @@ signal.signal(signal.SIGINT, _sig_handler)
 #  CLOUDFLARE-ФИЛЬТР
 # ══════════════════════════════════════════════════════════════
 def is_cloudflare_host(host: str) -> bool:
-    """True, если host — IP из CF-диапазона или домен, резолвящийся в CF."""
     try:
         ip = ipaddress.ip_address(host)
         return any(ip in net for net in _CF_NETS)
     except ValueError:
         pass
-
-    # Доменное имя
     try:
         prev = socket.getdefaulttimeout()
         socket.setdefaulttimeout(2)
@@ -497,7 +502,6 @@ def read_log_tail(path, n=3):
 
 
 def test_one_server(v):
-    """Берёт порт из пула, поднимает Xray, делает STABILITY_CHECKS запросов."""
     try:
         port = PORT_POOL.get(timeout=120)
     except Empty:
@@ -543,7 +547,7 @@ def test_one_server(v):
 
 
 # ══════════════════════════════════════════════════════════════
-#  ХРАНИЛИЩА (атомарные)
+#  ХРАНИЛИЩА
 # ══════════════════════════════════════════════════════════════
 def _save_tested_unsafe():
     tmp = Path(str(TESTED_FILE) + ".tmp")
@@ -555,7 +559,6 @@ def _save_working_unsafe(servers):
     tmp = Path(str(WORKING_FILE) + ".tmp")
     tmp.write_text(json.dumps(servers, indent=2))
     tmp.replace(WORKING_FILE)
-    Path(CURRENT_IDX_FILE).write_text("0")
 
 
 def save_working_incremental(servers):
@@ -610,6 +613,112 @@ def load_all_servers():
 
 
 # ══════════════════════════════════════════════════════════════
+#  COOLDOWN-МЕХАНИКА
+# ══════════════════════════════════════════════════════════════
+def _get_cooldown_for(s: dict) -> int:
+    """
+    Возвращает длительность cooldown для сервера.
+    Базовая = BAN_COOLDOWN_SEC, растёт с числом предыдущих банов.
+    """
+    ban_count = s.get("ban_count", 0)
+    cooldown = BAN_COOLDOWN_SEC * (BAN_COOLDOWN_MULTIPLIER ** ban_count)
+    return min(int(cooldown), BAN_COOLDOWN_MAX)
+
+
+def is_server_available(s: dict, now: float | None = None) -> bool:
+    """
+    True, если сервер можно использовать СЕЙЧАС:
+      • никогда не банился, ИЛИ
+      • cooldown истёк
+    """
+    if now is None:
+        now = time.time()
+
+    if not s.get("banned_by_avito"):
+        return True
+
+    banned_at = s.get("banned_at", 0)
+    cooldown = _get_cooldown_for(s)
+    return (now - banned_at) >= cooldown
+
+
+def reset_expired_bans(servers: list[dict]) -> tuple[list[dict], int]:
+    """
+    Снимает метку banned_by_avito с тех, у кого cooldown истёк.
+    Возвращает (обновлённый_список, сколько_разбанено).
+    """
+    now = time.time()
+    unblocked = 0
+    for s in servers:
+        if s.get("banned_by_avito") and is_server_available(s, now):
+            s["banned_by_avito"] = False
+            s["unblocked_at"] = int(now)
+            unblocked += 1
+    return servers, unblocked
+
+
+def mark_banned(server_or_hash) -> bool:
+    """Помечает сервер как забаненный Avito, увеличивает ban_count."""
+    if isinstance(server_or_hash, dict):
+        h = server_hash(server_or_hash)
+    else:
+        h = server_or_hash
+
+    servers = load_working()
+    changed = False
+    now = int(time.time())
+    for s in servers:
+        if server_hash(s) == h:
+            if s.get("banned_by_avito"):
+                # Уже забанен — не трогаем
+                return False
+            s["banned_by_avito"] = True
+            s["banned_at"] = now
+            s["ban_count"] = s.get("ban_count", 0) + 1
+            changed = True
+            break
+
+    if changed:
+        _save_working_unsafe(servers)
+        cooldown = _get_cooldown_for(next(s for s in servers if server_hash(s) == h))
+        print(f"💀 Забанен: {h} (cooldown {cooldown // 60} мин)")
+    return changed
+
+
+def _pick_next_available(start_idx: int):
+    """
+    Возвращает индекс следующего доступного сервера.
+    Сначала сбрасывает истёкшие баны.
+    """
+    servers = load_working()
+    if not servers:
+        return None, servers
+
+    servers, unblocked = reset_expired_bans(servers)
+    if unblocked:
+        _save_working_unsafe(servers)
+        print(f"♻️ Разбанено (cooldown истёк): {unblocked}")
+
+    n = len(servers)
+    # Приоритет 1: доступные серверы (не в бане)
+    for offset in range(n):
+        idx = (start_idx + offset) % n
+        if is_server_available(servers[idx]):
+            return idx, servers
+
+    # Приоритет 2: если все в бане — берём того, у кого cooldown истекает раньше всех
+    print("⚠️ Все серверы в cooldown — беру тот, что разблокируется раньше всех")
+    best_idx = min(
+        range(n),
+        key=lambda i: servers[i].get("banned_at", 0) + _get_cooldown_for(servers[i]),
+    )
+    # Снимаем метку, чтобы использовать
+    servers[best_idx]["banned_by_avito"] = False
+    _save_working_unsafe(servers)
+    return best_idx, servers
+
+
+# ══════════════════════════════════════════════════════════════
 #  WORKER
 # ══════════════════════════════════════════════════════════════
 def _maybe_flush_tested():
@@ -650,11 +759,18 @@ def worker(v, idx, total):
     if verdict == "OK":
         v_copy = dict(v)
         v_copy["stability"] = stability
+        v_copy["banned_by_avito"] = False
+        v_copy["ban_count"] = 0
         with WINNERS_LOCK:
-            WINNERS.append(v_copy)
-            WINNERS.sort(key=lambda x: x.get("stability", 0), reverse=True)
-            save_working_incremental(WINNERS)
-            print(f"   ⭐ РАБОЧИЙ (stability={stability})! Всего: {len(WINNERS)}")
+            existing_hashes = {server_hash(w) for w in WINNERS}
+            if server_hash(v_copy) not in existing_hashes:
+                WINNERS.append(v_copy)
+                WINNERS.sort(key=lambda x: x.get("stability", 0), reverse=True)
+                save_working_incremental(WINNERS)
+                print(f"   ⭐ РАБОЧИЙ (stability={stability})! Всего: {len(WINNERS)}")
+            else:
+                print(f"   ♻️ Уже был в списке, пропускаю")
+
             if len(WINNERS) >= MAX_WINNERS:
                 STOP_FLAG = True
                 print(f"\n✅ Достигли {MAX_WINNERS} рабочих — останавливаю тест")
@@ -689,16 +805,14 @@ def mode_build():
 
     random.shuffle(fresh)
 
-    # ─── TCP-ping ───
     alive = ping_all(fresh)
     print(f"   TCP-живых: {len(alive)}")
     if not alive:
         print("❌ ни один не отвечает на TCP")
         sys.exit(1)
 
-    # ─── Отсеиваем Cloudflare ───
     before = len(alive)
-    print(f"🌐 Отсеиваю Cloudflare (может занять время)...")
+    print(f"🌐 Отсеиваю Cloudflare...")
     alive = [v for v in alive if not is_cloudflare_host(v["host"])]
     print(f"   отфильтровано: {before - len(alive)}, осталось: {len(alive)}")
 
@@ -708,7 +822,6 @@ def mode_build():
 
     random.shuffle(alive)
 
-    # ─── Avito-тест параллельно ───
     print(f"\n🧪 Avito-тест: {len(alive)} серверов, {NUM_WORKERS} параллельных Xray")
     print(f"   stability: {STABILITY_CHECKS} запросов с паузой {STABILITY_PAUSE}с")
     print(f"   лимитов по времени/количеству нет\n")
@@ -735,7 +848,6 @@ def mode_build():
                       f"DEAD={s['DEAD']} OTHER={s['OTHER']} XRAY_FAIL={s['XRAY_FAIL']} | "
                       f"{time.time() - start_ts:.0f}с\n")
 
-    # Скользящее окно задач
     with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
         futures = {}
         it = iter(enumerate(alive, 1))
@@ -764,7 +876,6 @@ def mode_build():
             if STOP_FLAG:
                 break
 
-    # ─── Итоги ───
     print("\n" + "═" * 60)
     print("ИТОГИ BUILD")
     print("═" * 60)
@@ -796,49 +907,97 @@ def mode_build():
 
 
 def mode_pick():
-    s = load_working()
-    if not s:
-        print("❌ список пуст")
+    idx, servers = _pick_next_available(0)
+    if idx is None:
+        print("❌ нет серверов вообще")
         sys.exit(1)
-    # Список уже отсортирован по stability
-    idx = load_current_idx() % len(s)
-    v = s[idx]
+    v = servers[idx]
     activate_server(v)
+    save_current_idx(idx)
     print(f"🎯 Активирован #{idx}: [{v['type']}] {v['name'] or v['host']}")
-    print(f"   host={v['host']} port={v['port']} stability={v.get('stability', '?')}")
+    print(f"   host={v['host']} port={v['port']} "
+          f"stability={v.get('stability', '?')} "
+          f"ban_count={v.get('ban_count', 0)}")
 
 
 def mode_next():
-    s = load_working()
-    if not s:
+    servers = load_working()
+    if not servers:
         print("❌ список пуст")
         sys.exit(1)
-    idx = (load_current_idx() + 1) % len(s)
-    save_current_idx(idx)
-    v = s[idx]
+
+    cur = load_current_idx()
+    if cur < len(servers):
+        mark_banned(servers[cur])
+
+    idx, servers = _pick_next_available(cur + 1)
+    if idx is None:
+        print("❌ нет доступных серверов")
+        sys.exit(1)
+
+    v = servers[idx]
     activate_server(v)
+    save_current_idx(idx)
     print(f"🔄 Переключено на #{idx}: [{v['type']}] {v['name'] or v['host']}")
-    print(f"   stability={v.get('stability', '?')}")
+    print(f"   stability={v.get('stability', '?')} "
+          f"ban_count={v.get('ban_count', 0)}")
+
+
+def mode_ban_current():
+    servers = load_working()
+    if not servers:
+        sys.exit(0)
+    cur = load_current_idx()
+    if cur < len(servers):
+        mark_banned(servers[cur])
 
 
 def mode_stats():
     tested = load_tested()
-    working = load_working()
-    print(f"Тестировано: {len(tested)}")
-    print(f"Рабочих:     {len(working)}")
-    for w in working:
-        print(f"  ★ {w.get('stability', '?')}/3  [{w['type']}] {w['name'] or w['host']}")
+    servers = load_working()
+    now = time.time()
+
+    available, cooldown = [], []
+    for s in servers:
+        if is_server_available(s, now):
+            available.append(s)
+        else:
+            cooldown.append(s)
+
+    print(f"Тестировано:      {len(tested)}")
+    print(f"Рабочих всего:    {len(servers)}")
+    print(f"  ✅ доступно:    {len(available)}")
+    print(f"  ❄️ в cooldown:  {len(cooldown)}")
+
+    if available:
+        print("\nДоступные:")
+        for s in available[:20]:
+            ban_info = ""
+            if s.get("ban_count", 0) > 0:
+                ban_info = f" (было банов: {s['ban_count']})"
+            print(f"  ★ {s.get('stability', '?')}/3  "
+                  f"[{s['type']}] {s['name'] or s['host']}{ban_info}")
+
+    if cooldown:
+        print("\nВ cooldown (когда разблокируются):")
+        for s in cooldown[:10]:
+            banned_at = s.get("banned_at", 0)
+            cd = _get_cooldown_for(s)
+            left = max(0, (banned_at + cd) - now)
+            print(f"  ❄️ {int(left // 60)} мин  "
+                  f"[{s['type']}] {s['name'] or s['host']}")
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "pick"
     modes = {
-        "build": mode_build,
-        "pick":  mode_pick,
-        "next":  mode_next,
-        "stats": mode_stats,
+        "build":       mode_build,
+        "pick":        mode_pick,
+        "next":        mode_next,
+        "stats":       mode_stats,
+        "ban-current": mode_ban_current,
     }
     if mode not in modes:
-        print(f"Usage: {sys.argv[0]} [build|pick|next|stats]")
+        print(f"Usage: {sys.argv[0]} [build|pick|next|stats|ban-current]")
         sys.exit(1)
     modes[mode]()
