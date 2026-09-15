@@ -1,5 +1,5 @@
 """
-PATCHED HttpClient: используем Firefox impersonate + Firefox UA.
+PATCHED HttpClient: используем Safari impersonate.
 Оригинал: parser/http/client.py из parser_avito v3.2.22
 """
 import time
@@ -10,11 +10,10 @@ from parser.cookies.base import CookiesProvider
 from parser.proxies.proxy import Proxy
 
 
-# ──── НАСТРОЙКИ, которые можно менять под эксперимент ────
-IMPERSONATE = "firefox135"   # или: safari_ios, chrome131_android, chrome_android
-USER_AGENT  = ("Mozilla/5.0 (Android 14; Mobile; rv:135.0) "
-               "Gecko/135.0 Firefox/135.0")
-# ─────────────────────────────────────────────────────────
+# ──── НАСТРОЙКИ ────
+IMPERSONATE = "safari184"        # macOS Safari 18.4
+# Альтернативы: "safari184_ios" (iPhone), "safari" (последняя)
+# ───────────────────
 
 
 class HttpClient:
@@ -38,18 +37,14 @@ class HttpClient:
         self._client = self._build_client()
 
     def _build_client(self) -> requests.Session:
-        # Ключевое отличие: impersonate не из fingerprint (там chrome),
-        # а жёстко firefox135.
+        # Ключевое: impersonate="safari184" — curl_cffi сам подставит
+        # правильные TLS/HTTP2 fingerprint и заголовки Safari.
         session = requests.Session(impersonate=IMPERSONATE)
 
+        # Добавляем только те заголовки, которые не конфликтуют с impersonate.
         default_headers = {
-            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "cache-control": "no-cache",
-            "pragma": "no-cache",
             "referer": "https://www.avito.ru/",
-            "user-agent": USER_AGENT,
-            # sec-ch-ua* НЕ добавляем — Firefox их не отправляет
         }
         session.headers.update(default_headers)
 
