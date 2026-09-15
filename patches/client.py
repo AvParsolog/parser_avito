@@ -71,17 +71,36 @@ class HttpClient:
     # ──────────────────────────────────────────────
     #  PLAYWRIGHT FALLBACK (WebKit / Safari)
     # ──────────────────────────────────────────────
-    async def _playwright_fetch(self, url: str) -> str:
+        async def _playwright_fetch(self, url: str) -> str:
         """
         Грузим HTML-страницу Avito (для прогрева сессии),
         затем из её контекста делаем fetch к API.
         Движок: WebKit (нативный Safari) с fallback на Chromium.
         """
-        from playwright.async_api import async_playwright, devices
+        from playwright.async_api import async_playwright
 
         proxy_str = self.proxy.get_httpx_proxy()
 
         async with async_playwright() as p:
+            # ─── Профиль устройства из объекта Playwright ───
+            safari_device = p.devices.get(PLAYWRIGHT_DEVICE)
+            if safari_device is None:
+                logger.warning(
+                    f"Профиль '{PLAYWRIGHT_DEVICE}' не найден, "
+                    f"использую минимальный iPhone-конфиг"
+                )
+                safari_device = {
+                    "user_agent": (
+                        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                        "Version/18.4 Mobile/15E148 Safari/604.1"
+                    ),
+                    "viewport": {"width": 393, "height": 659},
+                    "device_scale_factor": 3,
+                    "is_mobile": True,
+                    "has_touch": True,
+                }
+
             # ─── Выбираем движок ───
             browser = None
             engine_used = None
@@ -108,9 +127,6 @@ class HttpClient:
 
             logger.info(f"✅ Движок: {engine_used}")
 
-            # Берём профиль Safari-устройства (iPhone) из реестра Playwright.
-            safari_device = devices[PLAYWRIGHT_DEVICE]
-
             context_args = {
                 **safari_device,
                 "locale": "ru-RU",
@@ -122,8 +138,6 @@ class HttpClient:
             context = await browser.new_context(**context_args)
             page = await context.new_page()
 
-            # Анти-детект: скрываем webdriver и chrome-объекты.
-            # Для WebKit это тоже актуально, хоть и в меньшей степени.
             await page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'platform', { get: () => 'iPhone' });
@@ -173,7 +187,7 @@ class HttpClient:
                         f"Playwright получил НЕ JSON (первые 200 символов): {body[:200]!r}"
                     )
 
-                # ─── ШАГ 3: забираем cookies обратно ───
+                # ─── ШАГ 3: cookies обратно в провайдер ───
                 if self.cookies and hasattr(self.cookies, "last_cookies"):
                     try:
                         pw_cookies = await context.cookies()
