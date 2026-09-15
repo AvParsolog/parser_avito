@@ -1,5 +1,5 @@
 """
-PATCHED HttpClient: используем Safari impersonate.
+PATCHED HttpClient: имитация мобильного Safari (iOS) для Avito.
 Оригинал: parser/http/client.py из parser_avito v3.2.22
 """
 import time
@@ -9,11 +9,11 @@ from loguru import logger
 from parser.cookies.base import CookiesProvider
 from parser.proxies.proxy import Proxy
 
-
-# ──── НАСТРОЙКИ ────
-IMPERSONATE = "safari184"        # macOS Safari 18.4
-# Альтернативы: "safari184_ios" (iPhone), "safari" (последняя)
-# ───────────────────
+# ──── КЛЮЧЕВЫЕ НАСТРОЙКИ ────
+# Имитируем Safari 18.4 на iPhone
+IMPERSONATE = "safari184_ios"
+# Альтернатива для более новой версии: "safari260_ios"
+# ────────────────────────────
 
 
 class HttpClient:
@@ -37,23 +37,27 @@ class HttpClient:
         self._client = self._build_client()
 
     def _build_client(self) -> requests.Session:
-        # Ключевое: impersonate="safari184" — curl_cffi сам подставит
-        # правильные TLS/HTTP2 fingerprint и заголовки Safari.
+        # 1. Создаём сессию с имперсонацией iOS Safari.
+        #    curl_cffi сам установит правильные TLS/HTTP2 отпечатки и User-Agent.
         session = requests.Session(impersonate=IMPERSONATE)
 
-        # Добавляем только те заголовки, которые не конфликтуют с impersonate.
+        # 2. Добавляем только те заголовки, которые характерны для Safari
+        #    и не конфликтуют с автоматической настройкой.
+        #    Мы НЕ добавляем User-Agent, sec-ch-ua* и другие заголовки Chrome.
         default_headers = {
             "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "referer": "https://www.avito.ru/",
         }
         session.headers.update(default_headers)
 
+        # 3. Загружаем cookies, если они есть (пока их нет, но это на будущее)
         if self.cookies:
             try:
                 session.cookies.update(self.cookies.get())
             except Exception as err:
                 logger.warning(f"Не удалось загрузить cookies: {err}")
 
+        # 4. Настраиваем прокси (это ваш локальный Xray)
         proxy = self.proxy.get_httpx_proxy()
         if proxy:
             session.proxies = {"http": proxy, "https": proxy}
@@ -73,7 +77,9 @@ class HttpClient:
                 if self.cookies:
                     self.cookies.update(response)
 
-                print(response.url)
+                # Оставляем print для отладки, но можно закомментировать
+                # print(response.url)
+
                 if response.status_code in (403, 429, 439):
                     self._block_attempts += 1
                     logger.warning(
