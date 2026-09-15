@@ -15,8 +15,6 @@ permissions:
   contents: read
   actions: write
 
-# chain-раны (self-renew) отменяют всё в группе, в т.ч. зависшие scheduled.
-# scheduled/manual — стоят в очереди, но вытесняются, когда стартует chain.
 concurrency:
   group: avito-parser
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source == 'chain' }}
@@ -53,55 +51,265 @@ jobs:
             echo "❌ Секрет CONFIG_TOML_B64 не задан!"
             exit 1
           fi
-
           printf '%s' "$CONFIG_TOML_B64" | base64 -d > data/config.toml
-
           if [ ! -s data/config.toml ]; then
-            echo "❌ config.toml пустой после декодирования!"
+            echo "❌ config.toml пустой!"
             exit 1
           fi
-
           if ! grep -q '^\[avito\]' data/config.toml; then
             echo "❌ В config.toml нет секции [avito]!"
             exit 1
           fi
-
-          echo "✅ config.toml декодирован: $(wc -l < data/config.toml) строк, $(wc -c < data/config.toml) байт"
+          echo "✅ config.toml декодирован: $(wc -l < data/config.toml) строк"
 
       - name: Sanitize config for current image
         run: |
           cat > data/sanitize.py <<'PYEOF'
           import tomllib, tomli_w, dataclasses, dto
-
           path = "config.toml"
           with open(path, "rb") as f:
               data = tomllib.load(f)
-
           valid = {f.name for f in dataclasses.fields(dto.AvitoConfig)}
           avito = data.get("avito", {})
           removed = [k for k in list(avito.keys()) if k not in valid]
           for k in removed:
               del avito[k]
-
           with open(path, "wb") as f:
               tomli_w.dump(data, f)
-
           print(f"🧹 Удалено полей, неизвестных образу: {removed if removed else '(нет)'}")
-          print(f"✅ Осталось полей: {len(avito)}")
           PYEOF
-
           docker run --rm \
             -v "$PWD/data/config.toml:/app/config.toml" \
             -v "$PWD/data/sanitize.py:/app/sanitize.py:ro" \
             --entrypoint python \
             ghcr.io/duff89/parser_avito:latest /app/sanitize.py
 
+      - name: Setup Xray + pick working Russian VLESS server
+        run: |
+          set -e
+          # --- Xray ---
+          echo "⬇️ Скачиваю Xray-core..."
+          curl -fsSL -o /tmp/xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          mkdir -p xray_bin
+          unzip -q /tmp/xray.zip -d xray_bin
+          chmod +x xray_bin/xray
+          ./xray_bin/xray version | head -n1
+
+          # --- Пикер сервера ---
+          cat > data/pick_vless.py <<'PYEOF'
+          import urllib.parse, urllib.request, socket, json, sys, random
+
+          VLESS_LIST_URL = "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt"
+          XRAY_CONFIG = "data/xray_config.json"
+          PROXY_PORT = 1080
+          TCP_TIMEOUT = 3
+          MAX_TRY = 40
+
+          RU_TAGS = ["ru", "russia", "россия", "🇷🇺", "russian", "msk", "moscow",
+                     "спб", "saint", "petersburg", "novosibirsk", "ekaterinburg"]
+
+          def fetch_list():
+              req = urllib.request.Request(VLESS_LIST_URL, headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=25) as r:
+                  return r.read().decode("utf-8", "ignore").splitlines()
+
+          def parse_vless(url):
+              if not url.startswith("vless://"):
+                  return None
+              try:
+                  u = urllib.parse.urlparse(url)
+                  params = dict(urllib.parse.parse_qsl(u.query))
+                  return {
+                      "uuid": urllib.parse.unquote(u.username or ""),
+                      "host": u.hostname,
+                      "port": u.port,
+                      "params": params,
+                      "name": urllib.parse.unquote(u.fragment) if u.fragment else "",
+                  }
+              except Exception:
+                  return None
+
+          def is_russian(v):
+              blob = (v["name"] or "").lower()
+              return any(t in blob for t in RU_TAGS)
+
+          def tcp_ping(host, port, timeout=TCP_TIMEOUT):
+              try:
+                  s = socket.create_connection((host, port), timeout=timeout)
+                  s.close()
+                  return True
+              except Exception:
+                  return False
+
+          def is_config_usable(v):
+              p = v["params"]
+              sec = p.get("security", "none")
+              net = p.get("type", "tcp")
+              if sec == "reality" and not p.get("pbk"):
+                  return False
+              if net == "grpc" and not p.get("serviceName"):
+                  return False
+              return True
+
+          def build_xray_config(v):
+              p = v["params"]
+              net = p.get("type", "tcp")
+              security = p.get("security", "none")
+
+              stream = {"network": net}
+              if net == "ws":
+                  stream["wsSettings"] = {
+                      "path": p.get("path", "/"),
+                      "headers": {"Host": p.get("host", v["host"])},
+                  }
+              elif net == "grpc":
+                  stream["grpcSettings"] = {"serviceName": p.get("serviceName", "")}
+              elif net == "tcp" and p.get("headerType") == "http":
+                  stream["tcpSettings"] = {
+                      "header": {
+                          "type": "http",
+                          "request": {
+                              "path": [p.get("path", "/")],
+                              "headers": {"Host": [p.get("host", v["host"])]},
+                          },
+                      }
+                  }
+
+              if security == "tls":
+                  stream["security"] = "tls"
+                  stream["tlsSettings"] = {
+                      "serverName": p.get("sni", v["host"]),
+                      "fingerprint": p.get("fp", "chrome"),
+                      "allowInsecure": p.get("allowInsecure", "0") == "1",
+                  }
+              elif security == "reality":
+                  stream["security"] = "reality"
+                  stream["realitySettings"] = {
+                      "serverName": p.get("sni", ""),
+                      "fingerprint": p.get("fp", "chrome"),
+                      "publicKey": p.get("pbk", ""),
+                      "shortId": p.get("sid", ""),
+                      "spiderX": p.get("spx", "/"),
+                  }
+
+              return {
+                  "log": {"loglevel": "warning"},
+                  "inbounds": [{
+                      "listen": "127.0.0.1",
+                      "port": PROXY_PORT,
+                      "protocol": "http",
+                      "settings": {"timeout": 0},
+                  }],
+                  "outbounds": [{
+                      "protocol": "vless",
+                      "settings": {
+                          "vnext": [{
+                              "address": v["host"],
+                              "port": int(v["port"]),
+                              "users": [{
+                                  "id": v["uuid"],
+                                  "encryption": "none",
+                                  "flow": p.get("flow", ""),
+                              }],
+                          }],
+                      },
+                      "streamSettings": stream,
+                  }],
+              }
+
+          def main():
+              print("📥 Скачиваю список VLESS...")
+              lines = fetch_list()
+              print(f"   строк в файле: {len(lines)}")
+
+              parsed = [parse_vless(l.strip()) for l in lines if l.strip().startswith("vless://")]
+              parsed = [v for v in parsed if v and v["host"] and v["port"] and v["uuid"]]
+              print(f"   валидных VLESS: {len(parsed)}")
+
+              ru = [v for v in parsed if is_russian(v) and is_config_usable(v)]
+              print(f"   российских и пригодных: {len(ru)}")
+
+              if not ru:
+                  print("❌ Нет пригодных российских серверов")
+                  sys.exit(1)
+
+              random.shuffle(ru)
+              checked = 0
+              for v in ru:
+                  if checked >= MAX_TRY:
+                      break
+                  checked += 1
+                  ok = tcp_ping(v["host"], v["port"])
+                  mark = "✅" if ok else "❌"
+                  print(f"   [{checked:02d}] {mark} {v['host']}:{v['port']} — {(v['name'] or '')[:50]}")
+                  if ok:
+                      cfg = build_xray_config(v)
+                      with open(XRAY_CONFIG, "w") as f:
+                          json.dump(cfg, f, indent=2)
+                      print(f"\n🎯 Выбран: {v['name'] or v['host']}")
+                      print(f"   host={v['host']} port={v['port']} "
+                            f"security={v['params'].get('security','none')} "
+                            f"net={v['params'].get('type','tcp')}")
+                      return
+
+              print("❌ Ни один сервер не ответил на TCP ping")
+              sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          python3 data/pick_vless.py
+
+      - name: Start Xray proxy
+        run: |
+          set -e
+          nohup ./xray_bin/xray -c data/xray_config.json > data/xray.log 2>&1 &
+          echo $! > data/xray.pid
+          echo "Xray PID: $(cat data/xray.pid)"
+
+          # Ждём пока порт 1080 откроется
+          for i in $(seq 1 20); do
+            if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
+              exec 3>&- 3<&-
+              echo "✅ Xray слушает на 127.0.0.1:1080 (после ${i}с)"
+              # Тест наружу через xray
+              echo "🌐 Проверяю внешний IP через прокси..."
+              curl -s --max-time 15 -x http://127.0.0.1:1080 https://api.ipify.org || echo "(не удалось получить IP)"
+              echo ""
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ Xray не поднялся за 20 секунд. Лог:"
+          cat data/xray.log || true
+          exit 1
+
+      - name: Patch config with local xray proxy
+        run: |
+          pip install --quiet tomli_w
+          python3 - <<'PYEOF'
+          import tomllib, tomli_w
+          with open("data/config.toml", "rb") as f:
+              data = tomllib.load(f)
+          data.setdefault("avito", {})
+          data["avito"]["proxy_string"] = "127.0.0.1:1080"
+          data["avito"]["proxy_change_url"] = ""
+          data["avito"]["use_bypass_api"] = False
+          data["avito"]["use_own_cookies"] = False
+          with open("data/config.toml", "wb") as f:
+              tomli_w.dump(data, f)
+          print("✅ config.toml: proxy_string = 127.0.0.1:1080")
+          PYEOF
+
       - name: Run parser loop (5.5 hours)
         run: |
           set -u
-          END_TIME=$(( $(date +%s) + 19800 ))    # 5.5 часов
-          CYCLE_INTERVAL=300                     # 5 минут между циклами
-          PARSER_MAX_RUNTIME=270                 # максимум 4.5 мин на один проход
+          END_TIME=$(( $(date +%s) + 19800 ))
+          CYCLE_INTERVAL=300
+          PARSER_MAX_RUNTIME=270
 
           CYCLE=0
           while [ $(date +%s) -lt $END_TIME ]; do
@@ -115,6 +323,7 @@ jobs:
 
             timeout --signal=SIGTERM --kill-after=15 $PARSER_MAX_RUNTIME \
               docker run --rm \
+                --network host \
                 --name "$CONTAINER_NAME" \
                 -v "$PWD/data/config.toml:/app/config.toml:ro" \
                 -v "$PWD/data/database.db:/app/database.db" \
@@ -159,37 +368,25 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set +e
-
           if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
-            echo "⚠️ TG_BOT_TOKEN или TG_CHAT_ID не заданы — пропускаю отправку"
+            echo "⚠️ TG секреты не заданы — пропускаю"
             exit 0
           fi
-
           shopt -s nullglob
           files=(result/*.xlsx result/*.csv result/*.json)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "⚠️ В result/ нет файлов — отправлять нечего"
+            echo "⚠️ В result/ нет файлов"
             exit 0
           fi
-
           if [ ${#files[@]} -eq 1 ]; then
             SEND_FILE="${files[0]}"
           else
             SEND_FILE="avito_results_${RUN_ID}.zip"
             zip -j -q "$SEND_FILE" "${files[@]}"
           fi
-
-          SIZE_BYTES=$(stat -c%s "$SEND_FILE")
-          SIZE_MB=$(( SIZE_BYTES / 1024 / 1024 ))
-          CAPTION="📊 Avito Parser — результаты run ${RUN_ID} | файлов: ${#files[@]} | размер: ${SIZE_MB} MB"
-
-          echo "📤 Отправляю ${SEND_FILE} (${SIZE_BYTES} байт)"
-          echo "   chat_id: ${TG_CHAT_ID}"
-          echo "   caption: ${CAPTION}"
-
-          # Несколько chat_id через запятую
+          SIZE_MB=$(( $(stat -c%s "$SEND_FILE") / 1024 / 1024 ))
+          CAPTION="📊 Avito Parser — run ${RUN_ID} | файлов: ${#files[@]} | размер: ${SIZE_MB} MB"
           IFS=',' read -ra CHATS <<< "$TG_CHAT_ID"
-          ALL_OK=0
           for CHAT in "${CHATS[@]}"; do
             CHAT="$(echo "$CHAT" | xargs)"
             [ -z "$CHAT" ] && continue
@@ -199,18 +396,21 @@ jobs:
               -F "caption=${CAPTION}" \
               -F "document=@${SEND_FILE}" \
               "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument")
-
             if [ "$HTTP_CODE" = "200" ]; then
               echo "   ✅ отправлено"
             else
-              echo "   ❌ ошибка HTTP ${HTTP_CODE}:"
-              cat /tmp/tg_resp.json || true
-              ALL_OK=1
+              echo "   ❌ HTTP ${HTTP_CODE}:"; cat /tmp/tg_resp.json || true
             fi
           done
-
-          # Не валим job, даже если TG не принял — workflow важнее
           exit 0
+
+      - name: Stop Xray
+        if: always()
+        run: |
+          if [ -f data/xray.pid ]; then
+            kill "$(cat data/xray.pid)" 2>/dev/null || true
+            echo "🛑 Xray остановлен"
+          fi
 
       - name: Save state for next run
         if: always()
@@ -221,12 +421,11 @@ jobs:
             storage/
           key: ${{ runner.os }}-parser-state-${{ github.run_id }}
 
-      - name: 🔄 Self-renew — запускаю следующий workflow
+      - name: 🔄 Self-renew
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Запускаю следующую итерацию (chain)..."
           gh workflow run parser.yml \
             --repo "${{ github.repository }}" \
             --ref "${{ github.ref_name }}" \
