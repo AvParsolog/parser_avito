@@ -1,26 +1,32 @@
 name: Avito Parser — Continuous Runner
 
 on:
-  # Страховочный cron: если цепочка само-перезапуска оборвётся, GitHub сам
-  # поднимет её в течение 6 часов.
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
+    inputs:
+      source:
+        description: 'Trigger source (internal)'
+        required: false
+        default: 'manual'
+        type: string
 
-# Нужны права на запуск workflow (для само-перезапуска) и на чтение кода
 permissions:
   contents: read
   actions: write
 
-# Не даём двум запускам работать одновременно
+# Хитрый concurrency:
+#  • chain   → cancel-in-progress: true  (убивает всё в группе, включая зависшие)
+#  • schedule/manual → cancel-in-progress: false (стоит в очереди, но будет
+#    вытеснен, когда следующий chain-ран стартует)
 concurrency:
   group: avito-parser
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source == 'chain' }}
 
 jobs:
   parse-loop:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # 5ч50м — с запасом меньше 6-часового лимита GitHub
+    timeout-minutes: 350
 
     steps:
       - name: Checkout
@@ -67,9 +73,9 @@ jobs:
       - name: Run parser loop (5.5 hours)
         run: |
           set -u
-          END_TIME=$(( $(date +%s) + 19800 ))    # 5.5 часов
-          CYCLE_INTERVAL=300                     # 5 минут между циклами
-          PARSER_MAX_RUNTIME=270                 # максимум 4.5 мин на один проход
+          END_TIME=$(( $(date +%s) + 19800 ))
+          CYCLE_INTERVAL=300
+          PARSER_MAX_RUNTIME=270
 
           CYCLE=0
           while [ $(date +%s) -lt $END_TIME ]; do
@@ -81,7 +87,6 @@ jobs:
             echo "▶ Цикл #${CYCLE} стартовал: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "═══════════════════════════════════════════════════"
 
-            # one_time_start=true в конфиге → парсер завершится сам после прохода
             timeout --signal=SIGTERM --kill-after=15 $PARSER_MAX_RUNTIME \
               docker run --rm \
                 --name "$CONTAINER_NAME" \
@@ -92,7 +97,6 @@ jobs:
                 ghcr.io/duff89/parser_avito:latest \
               || echo "⚠️ Проход завершился с кодом $? — продолжаю"
 
-            # На всякий случай добиваем зависший контейнер
             docker kill "$CONTAINER_NAME" 2>/dev/null || true
 
             ELAPSED=$(( $(date +%s) - CYCLE_START ))
@@ -129,7 +133,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Запускаю следующую итерацию…"
+          echo "Запускаю следующую итерацию (chain)..."
           gh workflow run parser.yml \
             --repo "${{ github.repository }}" \
-            --ref "${{ github.ref_name }}"
+            --ref "${{ github.ref_name }}" \
+            -f source=chain
