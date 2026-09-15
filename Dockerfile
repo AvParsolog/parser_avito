@@ -1,36 +1,13 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
 LABEL org.opencontainers.image.source=https://github.com/avparsolog/parser_avito
 
-RUN apt-get update && apt-get install \
--y --ignore-missing --no-install-recommends --no-install-suggests \
-	libatk-bridge2.0-0t64 \
-	libatk1.0-0t64 \
-	libatspi2.0-0t64 \
-	libcairo2 \
-	libdbus-1-3 \
-	libdrm2 \
-	libgbm1 \
-	libglib2.0-0t64 \
-	libnspr4 \
-	libnss3 \
-	libpango-1.0-0 \
-	libxcomposite1 \
-	libxdamage1 \
-	libxfixes3 \
-	libxrandr2 \
-	libxkbcommon0 \
-	libasound2 \
-	&& apt-get autopurge \
-	&& apt-get clean \
-	&& apt-get distclean
-
-COPY requirements.txt /app/requirements.txt
 WORKDIR /app
+COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# ─── Браузеры: Chromium (базовый) + WebKit (для Safari-эмуляции) ───
+# Обновляем браузеры под версию playwright из requirements.txt.
+# В этом образе уже есть все системные зависимости для Chromium и WebKit.
 RUN python -m playwright install chromium-headless-shell webkit
-RUN python -m playwright install-deps webkit
 
 COPY . /app
 COPY entrypoint.sh /
