@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
 """
-Пикер VLESS/VMess/Trojan серверов для Avito.
-Режимы:
-  python pick_vless.py build   → протестировать все источники, записать рабочие
-  python pick_vless.py pick    → выбрать один рабочий сервер (из already built)
-  python pick_vless.py next    → переключиться на следующий рабочий сервер
+Высокопараллельный пикер VLESS/VMess/Trojan для Avito.
+Запускает N Xray-инстансов на разных портах — тестирует N серверов одновременно.
 """
+import os
 import sys
 import json
 import time
 import socket
 import random
+import hashlib
+import shutil
 import subprocess
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+from threading import Lock
 from pathlib import Path
 
-# ─── Источники (только VLESS/VMess/Trojan) ───
+# ─── Источники ───
 SOURCES = [
-    # zieng2
     "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt",
-    # clean
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/clean/vless.txt",
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/clean/vmess.txt",
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/clean/trojan.txt",
-    # ru-sni
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/ru-sni/vless.txt",
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/ru-sni/vmess.txt",
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/ru-sni/trojan.txt",
-    # ru-sni-local
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/ru-sni-local/vless.txt",
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/ru-sni-local/vmess.txt",
     "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/data/githubmirror/ru-sni-local/trojan.txt",
@@ -36,470 +35,524 @@ SOURCES = [
 
 # ─── Пути ───
 XRAY_BIN         = "xray_bin/xray"
-XRAY_CONFIG      = "data/xray_config.json"
-XRAY_LOG         = "data/xray_test.log"
-PROXY_PORT       = 1080
-WORKING_FILE     = "data/working_servers.json"   # список рабочих (JSON)
-CURRENT_IDX_FILE = "data/current_server_idx"     # индекс текущего рабочего
+WORKING_FILE     = "data/working_servers.json"
+TESTED_FILE      = "data/tested_servers.txt"
+CURRENT_IDX_FILE = "data/current_server_idx"
 TEST_LOG_FILE    = "data/test_log.txt"
+TMP_DIR          = Path("data/tmp_xray")
+
+# ─── Параллельность ───
+NUM_WORKERS       = 30            # одновременных Xray-инстансов
+TCP_THREADS       = 200           # потоков для TCP-ping
+PORT_BASE         = 10800         # 10800, 10801, ... 10829
 
 # ─── Тайминги ───
-TCP_TIMEOUT  = 3
-XRAY_WAIT    = 4
-HTTP_TIMEOUT = 15
+TCP_TIMEOUT        = 2
+XRAY_WAIT          = 3
+HTTP_TIMEOUT       = 8            # короче, чем было — быстрее тест
+BUILD_TIME_BUDGET  = 90 * 60
+MAX_WINNERS        = 20           # ищем до 20 рабочих, потом останавливаемся
 
-# ─── Тестовый URL Avito ───
+# ─── Тестовый URL ───
 TEST_URL = (
     "https://www.avito.ru/web/1/js/items"
     "?categoryId=6&localPriority=0&locationId=637640"
     "&presentationType=serp&query=mac+mini+m4&sort=default&page=1"
 )
+CURL_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1"
+)
 
-# ─── RU-маркеры ───
-RU_TAGS = ["ru", "russia", "россия", "🇷🇺", "russian", "msk", "moscow",
-           "спб", "saint", "petersburg", "novosibirsk", "ekaterinburg"]
+# ─── Глобальное состояние ───
+PORT_POOL      = Queue()
+for i in range(NUM_WORKERS):
+    PORT_POOL.put(PORT_BASE + i)
+
+TESTED_LOCK    = Lock()
+TESTED_SET     = set()
+
+WINNERS_LOCK   = Lock()
+WINNERS        = []
+
+STATS_LOCK     = Lock()
+STATS          = {"OK": 0, "IP_BAN": 0, "BLOCK": 0, "DEAD": 0,
+                  "OTHER": 0, "ERROR": 0, "XRAY_FAIL": 0}
+
+LOG_LOCK       = Lock()
+LOG_LINES      = []
+
+STOP_FLAG      = False
 
 
 # ═══════════════════════════════════════════════════════
-#  ЗАГРУЗКА И ПАРСИНГ
+#  ЗАГРУЗКА / ПАРСИНГ
 # ═══════════════════════════════════════════════════════
-def fetch_list(url: str) -> list[str]:
+def fetch_list(url):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode("utf-8", "ignore").splitlines()
     except Exception as e:
-        print(f"  ⚠️ Не удалось скачать {url}: {e}")
+        print(f"  ⚠️ {url}: {e}")
         return []
 
 
-def parse_vless(url: str):
-    if not url.startswith("vless://"):
-        return None
+def parse_vless(url):
+    if not url.startswith("vless://"): return None
     try:
         u = urllib.parse.urlparse(url)
-        params = dict(urllib.parse.parse_qsl(u.query))
-        return {
-            "type": "vless",
-            "uuid": urllib.parse.unquote(u.username or ""),
-            "host": u.hostname,
-            "port": u.port,
-            "params": params,
-            "name": urllib.parse.unquote(u.fragment) if u.fragment else "",
-            "raw": url,
-        }
-    except Exception:
-        return None
+        p = dict(urllib.parse.parse_qsl(u.query))
+        return {"type": "vless", "uuid": urllib.parse.unquote(u.username or ""),
+                "host": u.hostname, "port": u.port, "params": p,
+                "name": urllib.parse.unquote(u.fragment) if u.fragment else "", "raw": url}
+    except Exception: return None
 
 
-def parse_vmess(url: str):
-    """VMess в base64 JSON."""
+def parse_vmess(url):
     import base64
-    if not url.startswith("vmess://"):
-        return None
+    if not url.startswith("vmess://"): return None
     try:
-        b64 = url[len("vmess://"):]
-        # padding
-        b64 += "=" * (-len(b64) % 4)
-        decoded = base64.b64decode(b64).decode("utf-8")
-        data = json.loads(decoded)
-        return {
-            "type": "vmess",
-            "uuid": data.get("id", ""),
-            "host": data.get("add", ""),
-            "port": int(data.get("port", 0)),
-            "params": {
-                "security": "tls" if data.get("tls") == "tls" else "none",
-                "type": data.get("net", "tcp"),
-                "path": data.get("path", "/"),
-                "host": data.get("host", ""),
-                "sni": data.get("sni", data.get("host", "")),
-                "fp": "chrome",
-            },
-            "name": data.get("ps", ""),
-            "raw": url,
-        }
-    except Exception:
-        return None
+        b64 = url[8:]; b64 += "=" * (-len(b64) % 4)
+        d = json.loads(base64.b64decode(b64).decode("utf-8"))
+        return {"type": "vmess", "uuid": d.get("id",""), "host": d.get("add",""),
+                "port": int(d.get("port",0)),
+                "params": {"security": "tls" if d.get("tls")=="tls" else "none",
+                           "type": d.get("net","tcp"), "path": d.get("path","/"),
+                           "host": d.get("host",""), "sni": d.get("sni", d.get("host","")),
+                           "fp": "chrome"},
+                "name": d.get("ps",""), "raw": url}
+    except Exception: return None
 
 
-def parse_trojan(url: str):
-    if not url.startswith("trojan://"):
-        return None
+def parse_trojan(url):
+    if not url.startswith("trojan://"): return None
     try:
         u = urllib.parse.urlparse(url)
-        params = dict(urllib.parse.parse_qsl(u.query))
-        return {
-            "type": "trojan",
-            "password": urllib.parse.unquote(u.username or ""),
-            "host": u.hostname,
-            "port": u.port,
-            "params": params,
-            "name": urllib.parse.unquote(u.fragment) if u.fragment else "",
-            "raw": url,
-        }
-    except Exception:
-        return None
+        p = dict(urllib.parse.parse_qsl(u.query))
+        return {"type": "trojan", "password": urllib.parse.unquote(u.username or ""),
+                "host": u.hostname, "port": u.port, "params": p,
+                "name": urllib.parse.unquote(u.fragment) if u.fragment else "", "raw": url}
+    except Exception: return None
 
 
-def parse_any(url: str):
+def parse_any(url):
     for fn in (parse_vless, parse_vmess, parse_trojan):
         v = fn(url)
-        if v:
-            return v
+        if v: return v
     return None
 
 
-def is_usable(v) -> bool:
-    if not v or not v.get("host") or not v.get("port"):
-        return False
+def is_usable(v):
+    if not v or not v.get("host") or not v.get("port"): return False
     p = v.get("params", {})
-    sec = p.get("security", "none")
-    net = p.get("type", "tcp")
-    if sec == "reality" and not p.get("pbk"):
-        return False
-    if net == "grpc" and not p.get("serviceName"):
-        return False
+    if p.get("security","none") == "reality" and not p.get("pbk"): return False
+    if p.get("type","tcp") == "grpc" and not p.get("serviceName"): return False
     return True
 
 
+def server_hash(v):
+    k = f"{v['type']}|{v['host']}|{v['port']}|{v.get('uuid') or v.get('password')}"
+    return hashlib.sha1(k.encode()).hexdigest()[:16]
+
+
 # ═══════════════════════════════════════════════════════
-#  ГЕНЕРАЦИЯ XRAY-КОНФИГА
+#  XRAY-КОНФИГ
 # ═══════════════════════════════════════════════════════
-def build_xray_config(v) -> dict:
-    t = v["type"]
-    p = v.get("params", {})
-    net = p.get("type", "tcp")
-    security = p.get("security", "none")
+def build_xray_config(v, port):
+    t, p = v["type"], v.get("params", {})
+    net, sec = p.get("type","tcp"), p.get("security","none")
 
     stream = {"network": net}
     if net == "ws":
-        stream["wsSettings"] = {
-            "path": p.get("path", "/"),
-            "headers": {"Host": p.get("host", v["host"])},
-        }
+        stream["wsSettings"] = {"path": p.get("path","/"),
+                                "headers": {"Host": p.get("host", v["host"])}}
     elif net == "grpc":
-        stream["grpcSettings"] = {"serviceName": p.get("serviceName", "")}
+        stream["grpcSettings"] = {"serviceName": p.get("serviceName","")}
     elif net == "tcp" and p.get("headerType") == "http":
-        stream["tcpSettings"] = {
-            "header": {
-                "type": "http",
-                "request": {
-                    "path": [p.get("path", "/")],
-                    "headers": {"Host": [p.get("host", v["host"])]},
-                },
-            }
-        }
+        stream["tcpSettings"] = {"header": {"type": "http",
+            "request": {"path": [p.get("path","/")],
+                        "headers": {"Host": [p.get("host", v["host"])]}}}}
 
-    if security == "tls":
+    if sec == "tls":
         stream["security"] = "tls"
-        stream["tlsSettings"] = {
-            "serverName": p.get("sni", v["host"]),
-            "fingerprint": p.get("fp", "chrome"),
-            "allowInsecure": p.get("allowInsecure", "0") == "1",
-        }
-    elif security == "reality":
+        stream["tlsSettings"] = {"serverName": p.get("sni", v["host"]),
+            "fingerprint": p.get("fp","chrome"),
+            "allowInsecure": p.get("allowInsecure","0") == "1"}
+    elif sec == "reality":
         stream["security"] = "reality"
-        stream["realitySettings"] = {
-            "serverName": p.get("sni", ""),
-            "fingerprint": p.get("fp", "chrome"),
-            "publicKey": p.get("pbk", ""),
-            "shortId": p.get("sid", ""),
-            "spiderX": p.get("spx", "/"),
-        }
+        stream["realitySettings"] = {"serverName": p.get("sni",""),
+            "fingerprint": p.get("fp","chrome"), "publicKey": p.get("pbk",""),
+            "shortId": p.get("sid",""), "spiderX": p.get("spx","/")}
 
-    # ─── Outbound ───
     if t == "vless":
-        outbound = {
-            "protocol": "vless",
-            "settings": {
-                "vnext": [{
-                    "address": v["host"],
-                    "port": int(v["port"]),
-                    "users": [{
-                        "id": v["uuid"],
-                        "encryption": "none",
-                        "flow": p.get("flow", ""),
-                    }],
-                }],
-            },
-            "streamSettings": stream,
-        }
+        out = {"protocol": "vless", "settings": {"vnext": [{"address": v["host"],
+            "port": int(v["port"]), "users": [{"id": v["uuid"], "encryption": "none",
+            "flow": p.get("flow","")}]}]}, "streamSettings": stream}
     elif t == "vmess":
-        outbound = {
-            "protocol": "vmess",
-            "settings": {
-                "vnext": [{
-                    "address": v["host"],
-                    "port": int(v["port"]),
-                    "users": [{
-                        "id": v["uuid"],
-                        "alterId": 0,
-                        "security": "auto",
-                    }],
-                }],
-            },
-            "streamSettings": stream,
-        }
+        out = {"protocol": "vmess", "settings": {"vnext": [{"address": v["host"],
+            "port": int(v["port"]), "users": [{"id": v["uuid"], "alterId": 0,
+            "security": "auto"}]}]}, "streamSettings": stream}
     elif t == "trojan":
-        outbound = {
-            "protocol": "trojan",
-            "settings": {
-                "servers": [{
-                    "address": v["host"],
-                    "port": int(v["port"]),
-                    "password": v["password"],
-                }],
-            },
-            "streamSettings": stream,
-        }
+        out = {"protocol": "trojan", "settings": {"servers": [{"address": v["host"],
+            "port": int(v["port"]), "password": v["password"]}]},
+            "streamSettings": stream}
     else:
-        raise ValueError(f"Неизвестный тип: {t}")
+        raise ValueError(f"Unknown type: {t}")
 
-    return {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "127.0.0.1",
-            "port": PROXY_PORT,
-            "protocol": "http",
-            "settings": {"timeout": 0},
-        }],
-        "outbounds": [outbound],
-    }
+    return {"log": {"loglevel": "warning"},
+            "inbounds": [{"listen": "127.0.0.1", "port": port,
+                          "protocol": "http", "settings": {"timeout": 0}}],
+            "outbounds": [out]}
 
 
 # ═══════════════════════════════════════════════════════
-#  TCP PING / XRAY START / TEST
+#  TCP PING
 # ═══════════════════════════════════════════════════════
-def tcp_ping(host, port, timeout=TCP_TIMEOUT) -> bool:
+def tcp_ping(v):
     try:
-        s = socket.create_connection((host, port), timeout=timeout)
+        s = socket.create_connection((v["host"], v["port"]), timeout=TCP_TIMEOUT)
         s.close()
-        return True
+        return v, True
     except Exception:
-        return False
+        return v, False
 
 
-def start_xray(v) -> subprocess.Popen | None:
-    cfg = build_xray_config(v)
-    Path(XRAY_CONFIG).write_text(json.dumps(cfg, indent=2))
-    with open(XRAY_LOG, "w") as log:
-        proc = subprocess.Popen(
-            [XRAY_BIN, "-c", XRAY_CONFIG],
-            stdout=log, stderr=log,
-        )
+def ping_all(servers):
+    alive = []
+    total = len(servers)
+    print(f"🔍 TCP-ping: {total} серверов, {TCP_THREADS} потоков")
+    with ThreadPoolExecutor(max_workers=TCP_THREADS) as ex:
+        futs = {ex.submit(tcp_ping, v): v for v in servers}
+        done = 0
+        for f in as_completed(futs):
+            done += 1
+            v, ok = f.result()
+            if ok: alive.append(v)
+            if done % 1000 == 0 or done == total:
+                print(f"   [{done}/{total}] живых: {len(alive)}")
+    return alive
+
+
+# ═══════════════════════════════════════════════════════
+#  XRAY WORKER (на своём порту)
+# ═══════════════════════════════════════════════════════
+def start_xray(v, port, cfg_path, log_path):
+    Path(cfg_path).write_text(json.dumps(build_xray_config(v, port), indent=2))
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen([XRAY_BIN, "-c", cfg_path],
+                                stdout=log, stderr=log)
     for _ in range(XRAY_WAIT * 4):
         try:
-            s = socket.create_connection(("127.0.0.1", PROXY_PORT), timeout=1)
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
             s.close()
-            time.sleep(0.5)
+            time.sleep(0.3)
             return proc
         except Exception:
-            time.sleep(0.25)
+            time.sleep(0.2)
     proc.terminate()
+    try: proc.wait(timeout=2)
+    except Exception: proc.kill()
     return None
 
 
 def stop_xray(proc):
-    if not proc:
-        return
+    if not proc: return
     try:
-        proc.terminate()
-        proc.wait(timeout=3)
+        proc.terminate(); proc.wait(timeout=2)
     except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        try: proc.kill()
+        except Exception: pass
 
 
-def test_avito_via_proxy() -> tuple[str, str]:
-    """Возвращает (verdict, info)."""
+def curl_avito_via_port(port):
     cmd = [
         "curl", "-sS", "--max-time", str(HTTP_TIMEOUT),
-        "-x", f"http://127.0.0.1:{PROXY_PORT}",
+        "-x", f"http://127.0.0.1:{port}",
         "-H", "Accept: application/json, text/plain, */*",
         "-H", "Referer: https://www.avito.ru/",
-        "-H", "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) "
-              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
+        "-H", f"User-Agent: {CURL_UA}",
         "-w", "\n__HTTP_CODE__%{http_code}",
         TEST_URL,
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=HTTP_TIMEOUT + 5)
-        out = res.stdout
-        code = ""
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=HTTP_TIMEOUT + 3)
+        out = r.stdout
         if "__HTTP_CODE__" in out:
             body, _, code = out.rpartition("__HTTP_CODE__")
         else:
-            body = out
-
-        body_stripped = body.strip()
-
-        if code == "200" and body_stripped.startswith(("{", "[")):
-            return "OK", f"HTTP 200, JSON len={len(body_stripped)}"
+            body, code = out, ""
+        body = body.strip()
+        if code == "200" and body.startswith(("{", "[")):
+            return "OK", f"200, len={len(body)}"
         if "Доступ ограничен" in body or "проблема с IP" in body:
-            return "IP_BAN", f"HTTP {code}, firewall page"
-        if code in ("403", "429", "439"):
-            return "BLOCK", f"HTTP {code}"
-        if code in ("000", ""):
+            return "IP_BAN", f"{code}, firewall"
+        if code in ("403","429","439"):
+            return "BLOCK", f"{code}"
+        if code in ("000",""):
             return "DEAD", "no response"
-        return "OTHER", f"HTTP {code}, body[:80]={body_stripped[:80]!r}"
+        return "OTHER", f"{code}, {body[:60]!r}"
     except subprocess.TimeoutExpired:
         return "DEAD", "timeout"
     except Exception as e:
         return "ERROR", str(e)
 
 
+def read_log_tail(path, n=3):
+    try:
+        with open(path) as f:
+            return " | ".join(l.strip() for l in f.readlines()[-n:] if l.strip())
+    except Exception:
+        return ""
+
+
+def test_one_server(v, idx, total):
+    """Тестирует один сервер — берёт порт из пула."""
+    global STOP_FLAG
+    if STOP_FLAG: return None
+
+    port = PORT_POOL.get()
+    try:
+        cfg_path = TMP_DIR / f"cfg_{port}.json"
+        log_path = TMP_DIR / f"log_{port}.log"
+
+        proc = start_xray(v, port, cfg_path, log_path)
+        if not proc:
+            tail = read_log_tail(log_path)
+            return ("XRAY_FAIL", f"xray fail | {tail}", port)
+
+        try:
+            verdict, info = curl_avito_via_port(port)
+            return (verdict, info, port)
+        finally:
+            stop_xray(proc)
+    finally:
+        # Чистим файлы и возвращаем порт
+        try:
+            (TMP_DIR / f"cfg_{port}.json").unlink(missing_ok=True)
+            (TMP_DIR / f"log_{port}.log").unlink(missing_ok=True)
+        except Exception:
+            pass
+        PORT_POOL.put(port)
+
+
+def worker(v, idx, total):
+    """Обрабатывает один сервер, пишет результаты в глоб. структуры."""
+    global STOP_FLAG
+    if STOP_FLAG: return
+
+    name = (v["name"] or v["host"])[:50]
+    result = test_one_server(v, idx, total)
+    if result is None: return
+
+    verdict, info, port = result
+
+    with TESTED_LOCK:
+        TESTED_SET.add(server_hash(v))
+
+    with STATS_LOCK:
+        STATS[verdict] = STATS.get(verdict, 0) + 1
+
+    with LOG_LOCK:
+        LOG_LINES.append(f"[{idx}] {verdict} {v['type']} {v['host']}:{v['port']} {name} | {info}")
+
+    # Печатаем только интересное (не DEAD/XRAY_FAIL — их слишком много)
+    if verdict not in ("DEAD",):
+        print(f"[{idx}/{total}] {verdict}: [{v['type']}] {v['host']}:{v['port']} — {name}")
+        if info and verdict in ("OK","OTHER","ERROR"):
+            print(f"          → {info}")
+
+    if verdict == "OK":
+        with WINNERS_LOCK:
+            WINNERS.append(v)
+            print(f"   ⭐ РАБОЧИЙ! Всего: {len(WINNERS)}")
+            if len(WINNERS) >= MAX_WINNERS:
+                STOP_FLAG = True
+                print(f"\n✅ Достигли {MAX_WINNERS} рабочих — останавливаю тест")
+
+
 # ═══════════════════════════════════════════════════════
-#  ЗАГРУЗКА ВСЕХ СЕРВЕРОВ
+#  ХРАНИЛИЩА
 # ═══════════════════════════════════════════════════════
-def load_all_servers() -> list[dict]:
-    seen = set()
-    servers = []
+def load_all_servers():
+    seen, servers = set(), []
     for src in SOURCES:
         print(f"📥 {src}")
         for line in fetch_list(src):
             line = line.strip()
-            if not line or line in seen:
-                continue
+            if not line or line in seen: continue
             seen.add(line)
             v = parse_any(line)
-            if is_usable(v):
-                servers.append(v)
+            if is_usable(v): servers.append(v)
     return servers
+
+
+def load_tested():
+    if not Path(TESTED_FILE).exists(): return set()
+    return set(Path(TESTED_FILE).read_text().splitlines())
+
+
+def save_tested(s):
+    Path(TESTED_FILE).write_text("\n".join(sorted(s)))
+
+
+def load_working():
+    if not Path(WORKING_FILE).exists(): return []
+    try: return json.loads(Path(WORKING_FILE).read_text())
+    except Exception: return []
+
+
+def save_working(servers):
+    Path(WORKING_FILE).write_text(json.dumps(servers, indent=2))
+    Path(CURRENT_IDX_FILE).write_text("0")
+
+
+def load_current_idx():
+    if not Path(CURRENT_IDX_FILE).exists(): return 0
+    try: return int(Path(CURRENT_IDX_FILE).read_text().strip() or "0")
+    except Exception: return 0
+
+
+def save_current_idx(idx): Path(CURRENT_IDX_FILE).write_text(str(idx))
+
+
+def activate_server(v):
+    """Собираем главный xray_config.json на порту 1080."""
+    Path("data/xray_config.json").write_text(
+        json.dumps(build_xray_config(v, 1080), indent=2)
+    )
 
 
 # ═══════════════════════════════════════════════════════
 #  РЕЖИМЫ
 # ═══════════════════════════════════════════════════════
-def save_working(servers: list[dict]):
-    Path(WORKING_FILE).write_text(json.dumps(servers, indent=2))
-    Path(CURRENT_IDX_FILE).write_text("0")
-
-
-def load_working() -> list[dict]:
-    if not Path(WORKING_FILE).exists():
-        return []
-    try:
-        return json.loads(Path(WORKING_FILE).read_text())
-    except Exception:
-        return []
-
-
-def load_current_idx() -> int:
-    if not Path(CURRENT_IDX_FILE).exists():
-        return 0
-    try:
-        return int(Path(CURRENT_IDX_FILE).read_text().strip() or "0")
-    except Exception:
-        return 0
-
-
-def save_current_idx(idx: int):
-    Path(CURRENT_IDX_FILE).write_text(str(idx))
-
-
-def activate_server(v: dict):
-    """Записать xray_config.json для конкретного сервера."""
-    cfg = build_xray_config(v)
-    Path(XRAY_CONFIG).write_text(json.dumps(cfg, indent=2))
-
-
 def mode_build():
-    """Протестировать все источники, записать рабочие."""
-    servers = load_all_servers()
-    print(f"   всего пригодных серверов: {len(servers)}")
+    global STOP_FLAG
+    start_ts = time.time()
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-    ru = [s for s in servers if any(t in (s["name"] or "").lower() for t in RU_TAGS)]
-    pool = ru if ru else servers
-    print(f"   в пуле (RU-приоритет): {len(pool)}")
+    all_servers = load_all_servers()
+    print(f"\n   всего пригодных серверов: {len(all_servers)}")
 
-    winners = []
-    stats = {"OK": 0, "IP_BAN": 0, "BLOCK": 0, "DEAD": 0, "OTHER": 0, "ERROR": 0}
-    log_lines = []
+    tested = load_tested()
+    print(f"   уже тестировалось: {len(tested)}")
 
-    for i, v in enumerate(pool, 1):
-        name = (v["name"] or v["host"])[:50]
-        print(f"\n[{i}/{len(pool)}] [{v['type']}] {v['host']}:{v['port']} — {name}")
+    for h in tested:
+        TESTED_SET.add(h)
 
-        if not tcp_ping(v["host"], v["port"]):
-            stats["DEAD"] += 1
-            print(f"   ❌ TCP ping fail")
-            log_lines.append(f"[{i}] DEAD {v['type']} {v['host']}:{v['port']} {name}")
-            continue
+    fresh = [v for v in all_servers if server_hash(v) not in TESTED_SET]
+    print(f"   новых: {len(fresh)}")
 
-        proc = start_xray(v)
-        if not proc:
-            stats["DEAD"] += 1
-            print(f"   ❌ Xray не поднялся")
-            log_lines.append(f"[{i}] XRAY_FAIL {v['type']} {v['host']}:{v['port']} {name}")
-            continue
+    if not fresh:
+        print("⚠️ Все протестированы — беру 2000 случайных")
+        random.shuffle(all_servers)
+        fresh = all_servers[:2000]
 
-        verdict, info = test_avito_via_proxy()
-        stop_xray(proc)
-        stats[verdict] = stats.get(verdict, 0) + 1
-        print(f"   → {verdict}: {info}")
-        log_lines.append(f"[{i}] {verdict} {v['type']} {v['host']}:{v['port']} {name} | {info}")
+    random.shuffle(fresh)
 
-        if verdict == "OK":
-            winners.append(v)
-            print(f"   ⭐ РАБОЧИЙ!")
+    # ─── TCP-ping параллельно ───
+    alive = ping_all(fresh)
+    print(f"   TCP-живых: {len(alive)}")
+    if not alive:
+        print("❌ ни один не отвечает на TCP")
+        sys.exit(1)
 
+    random.shuffle(alive)
+
+    # ─── Avito-тест параллельно ───
+    print(f"\n🧪 Avito-тест: {len(alive)} серверов, {NUM_WORKERS} параллельных Xray")
+    print(f"   бюджет: {BUILD_TIME_BUDGET//60} мин, цель: {MAX_WINNERS} рабочих\n")
+
+    done_count = [0]
+    done_lock = Lock()
+    total = len(alive)
+    last_progress = [time.time()]
+
+    def run_wrapper(args):
+        idx, v = args
+        if STOP_FLAG:
+            return
+        if time.time() - start_ts > BUILD_TIME_BUDGET:
+            global STOP_FLAG_INNER
+            return
+        worker(v, idx, total)
+        with done_lock:
+            done_count[0] += 1
+            # Прогресс каждые 30 сек
+            if time.time() - last_progress[0] > 30 or done_count[0] == total:
+                last_progress[0] = time.time()
+                with STATS_LOCK:
+                    stats_snap = dict(STATS)
+                print(f"\n📊 Прогресс: {done_count[0]}/{total} "
+                      f"({done_count[0]/total*100:.1f}%) | "
+                      f"OK={stats_snap['OK']} IP_BAN={stats_snap['IP_BAN']} "
+                      f"BLOCK={stats_snap['BLOCK']} DEAD={stats_snap['DEAD']} "
+                      f"OTHER={stats_snap['OTHER']} XRAY_FAIL={stats_snap['XRAY_FAIL']} | "
+                      f"{time.time()-start_ts:.0f}с\n")
+
+    # Отправляем задачи
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+        # Ограничиваем список задач, чтобы не буферизовать всё в памяти
+        list(ex.map(run_wrapper, enumerate(alive, 1)))
+
+    # ─── Итоги ───
     print("\n" + "═" * 60)
-    print("ИТОГИ ТЕСТИРОВАНИЯ")
+    print("ИТОГИ BUILD")
     print("═" * 60)
-    for k, n in stats.items():
-        print(f"  {k:8s}: {n}")
-    print(f"\nРабочих серверов: {len(winners)}")
+    for k, n in STATS.items():
+        print(f"  {k:10s}: {n}")
+    print(f"\nРабочих: {len(WINNERS)}")
+    print(f"Время: {(time.time()-start_ts)/60:.1f} мин")
 
-    Path(TEST_LOG_FILE).write_text("\n".join(log_lines))
-    save_working(winners)
+    Path(TEST_LOG_FILE).write_text("\n".join(LOG_LINES))
+    save_tested(TESTED_SET)
 
-    if winners:
-        print(f"\n💾 Сохранено в {WORKING_FILE}")
-        for w in winners:
+    if WINNERS:
+        save_working(WINNERS)
+        print(f"💾 Сохранил {len(WINNERS)} рабочих")
+        for w in WINNERS:
             print(f"  ✅ [{w['type']}] {w['name'] or w['host']}")
     else:
-        print("\n❌ Ни один сервер не прошёл проверку Avito")
-        sys.exit(1)
+        print("❌ Рабочих не найдено")
+        existing = load_working()
+        if existing:
+            print(f"   (оставляю ранее найденные: {len(existing)})")
+        elif alive:
+            save_working(alive[:5])
+            print(f"   (сохранил {min(5, len(alive))} fallback)")
 
 
 def mode_pick():
-    """Выбрать текущий рабочий сервер из already built."""
-    servers = load_working()
-    if not servers:
-        print("❌ Список рабочих пуст — сначала запустите build")
+    s = load_working()
+    if not s:
+        print("❌ список пуст")
         sys.exit(1)
-    idx = load_current_idx() % len(servers)
-    v = servers[idx]
-    activate_server(v)
-    print(f"🎯 Активирован сервер #{idx}: [{v['type']}] {v['name'] or v['host']}")
-    print(f"   host={v['host']} port={v['port']}")
+    idx = load_current_idx() % len(s)
+    activate_server(s[idx])
+    print(f"🎯 Активирован #{idx}: [{s[idx]['type']}] {s[idx]['name'] or s[idx]['host']}")
 
 
 def mode_next():
-    """Переключиться на следующий рабочий."""
-    servers = load_working()
-    if not servers:
-        print("❌ Список рабочих пуст")
-        sys.exit(1)
-    idx = (load_current_idx() + 1) % len(servers)
+    s = load_working()
+    if not s:
+        print("❌ список пуст"); sys.exit(1)
+    idx = (load_current_idx() + 1) % len(s)
     save_current_idx(idx)
-    v = servers[idx]
-    activate_server(v)
-    print(f"🔄 Переключено на сервер #{idx}: [{v['type']}] {v['name'] or v['host']}")
-    print(f"   host={v['host']} port={v['port']}")
+    activate_server(s[idx])
+    print(f"🔄 Переключено на #{idx}: [{s[idx]['type']}] {s[idx]['name'] or s[idx]['host']}")
+
+
+def mode_stats():
+    tested = load_tested()
+    working = load_working()
+    print(f"Тестировано: {len(tested)}")
+    print(f"Рабочих:     {len(working)}")
+    for w in working:
+        print(f"  ✅ [{w['type']}] {w['name'] or w['host']}")
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "pick"
-    if mode == "build":
-        mode_build()
-    elif mode == "pick":
-        mode_pick()
-    elif mode == "next":
-        mode_next()
-    else:
-        print(f"Usage: {sys.argv[0]} [build|pick|next]")
-        sys.exit(1)
+    {"build": mode_build, "pick": mode_pick,
+     "next": mode_next, "stats": mode_stats}.get(mode, mode_pick)()
