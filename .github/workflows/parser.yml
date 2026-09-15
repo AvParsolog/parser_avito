@@ -329,6 +329,7 @@ jobs:
                 -v "$PWD/data/database.db:/app/database.db" \
                 -v "$PWD/storage:/app/storage" \
                 -v "$PWD/result:/app/result" \
+                -v "$PWD/patches/client.py:/app/parser/http/client.py:ro"\
                 ghcr.io/duff89/parser_avito:latest \
               || echo "⚠️ Проход завершился с кодом $? — продолжаю"
 
@@ -344,21 +345,6 @@ jobs:
             fi
           done
           echo "✅ Истекли 5.5 часа, выходим из цикла"
-
-      - name: List results
-        if: always()
-        run: |
-          echo "════ Содержимое result/ ════"
-          ls -la result/ || echo "(папка пуста)"
-
-      - name: Upload Excel results (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: parser-results-${{ github.run_id }}
-          path: result/
-          if-no-files-found: ignore
-          retention-days: 7
 
       - name: Send results to Telegram
         if: always()
